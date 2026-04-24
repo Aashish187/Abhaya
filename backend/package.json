@@ -14,6 +14,7 @@
     "firebase-admin": "^13.0.0",
     "nodemailer": "^6.9.16",
     "polyline": "^0.2.0",
+    "sharp": "^0.34.3",
     "twilio": "^5.6.0"
   },
   "devDependencies": {

@@ -18,107 +18,55 @@ import { useFocusEffect } from '@react-navigation/native';
 import * as ImagePicker from 'expo-image-picker';
 
 import vehicleObservationAPI from '../services/vehicleObservations';
-import vehicleProfiles from '../assets/vehicleProfiles.json';
 
 const vehicleDetailFields = [
   ['plateNumber', 'Plate Number'],
-  ['driverName', 'Driver Name'],
-  ['driverPhone', 'Driver Phone'],
+  ['vehicleType', 'Vehicle Type'],
+  ['vehicleBrand', 'Brand'],
+  ['vehicleModel', 'Model'],
+  ['vehicleColor', 'Color'],
 ];
 
 const highlightFields = [
   ['plateNumber', 'Plate Number'],
   ['identificationMark', 'Visible Mark'],
-  ['driverName', 'Driver'],
-  ['driverPhone', 'Phone'],
+  ['vehicleColor', 'Color'],
 ];
 
-const normalizeValue = (value) => String(value || '').trim().toLowerCase();
+const unavailablePattern = /^(unknown\b.*|not available|plate not readable|plate not detected|-|n\/a)$/i;
+const isDisplayableValue = (value) => {
+  const text = String(value || '').trim();
+  return Boolean(text) && !unavailablePattern.test(text);
+};
+
+const getVehicleFieldValue = (item, key) => {
+  const value = item?.[key] || item?.vehicleDetails?.[key];
+  return isDisplayableValue(value) ? String(value).trim() : '';
+};
+
 const isNoPlateRecord = (item) =>
   Boolean(item?.noPlate) || /no plate/i.test(String(item?.plateNumber || item?.vehicleDetails?.plateNumber || ''));
-
-const findVehicleProfile = (item) => {
-  if (isNoPlateRecord(item)) {
-    return null;
-  }
-
-  const profileId = normalizeValue(item.profileId || item.vehicleDetails?.profileId);
-  const type = normalizeValue(item.vehicleType);
-  const brand = normalizeValue(item.vehicleBrand);
-  const model = normalizeValue(item.vehicleModel);
-  const color = normalizeValue(item.vehicleColor);
-
-  return (
-    vehicleProfiles.find((profile) => normalizeValue(profile.profileId) === profileId) ||
-    vehicleProfiles.find(
-      (profile) =>
-        normalizeValue(profile.vehicleType) === type &&
-        normalizeValue(profile.vehicleBrand) === brand &&
-        normalizeValue(profile.vehicleModel) === model &&
-        normalizeValue(profile.vehicleColor) === color
-    ) ||
-    vehicleProfiles.find(
-      (profile) =>
-        normalizeValue(profile.vehicleType) === type &&
-        normalizeValue(profile.vehicleBrand) === brand &&
-        normalizeValue(profile.vehicleModel) === model
-    ) ||
-    vehicleProfiles.find(
-      (profile) =>
-        normalizeValue(profile.vehicleType) === type &&
-        normalizeValue(profile.vehicleBrand) === brand
-    ) ||
-    vehicleProfiles.find((profile) => normalizeValue(profile.vehicleType) === type) ||
-    null
-  );
+const cropModes = {
+  plate: {
+    label: 'Plate Crop',
+    helper: 'Space on all sides',
+    icon: 'scan-outline',
+    aspect: [16, 9],
+  },
+  vehicle: {
+    label: 'Vehicle Crop',
+    helper: 'Wider evidence view',
+    icon: 'car-outline',
+    aspect: [4, 3],
+  },
 };
-
-const enrichVehicleRecord = (item) => {
-  const profile = findVehicleProfile(item);
-
-  if (!profile) {
-    return item;
-  }
-
-  return {
-    ...profile,
-    ...item,
-    vehicleDetails: {
-      ...profile,
-      ...(item.vehicleDetails || {}),
-      profileId: item.profileId || item.vehicleDetails?.profileId || profile.profileId,
-      plateNumber: item.plateNumber || item.vehicleDetails?.plateNumber || profile.plateNumber,
-      driverName: item.driverName || item.vehicleDetails?.driverName || profile.driverName,
-      driverPhone: item.driverPhone || item.vehicleDetails?.driverPhone || profile.driverPhone,
-      ownerName: item.ownerName || item.vehicleDetails?.ownerName || profile.ownerName,
-      operatorName: item.operatorName || item.vehicleDetails?.operatorName || profile.operatorName,
-      registrationZone:
-        item.registrationZone || item.vehicleDetails?.registrationZone || profile.registrationZone,
-      fuelType: item.fuelType || item.vehicleDetails?.fuelType || profile.fuelType,
-      seatingCapacity:
-        item.seatingCapacity || item.vehicleDetails?.seatingCapacity || profile.seatingCapacity,
-      vehicleCondition:
-        item.vehicleCondition ||
-        item.vehicleDetails?.vehicleCondition ||
-        profile.vehicleCondition,
-      identificationMark:
-        item.identificationMark ||
-        item.vehicleDetails?.identificationMark ||
-        profile.identificationMark,
-    },
-    profileId: item.profileId || profile.profileId,
-    plateNumber: item.plateNumber || profile.plateNumber,
-    driverName: item.driverName || profile.driverName,
-    driverPhone: item.driverPhone || profile.driverPhone,
-    ownerName: item.ownerName || profile.ownerName,
-    operatorName: item.operatorName || profile.operatorName,
-    registrationZone: item.registrationZone || profile.registrationZone,
-    fuelType: item.fuelType || profile.fuelType,
-    seatingCapacity: item.seatingCapacity || profile.seatingCapacity,
-    vehicleCondition: item.vehicleCondition || profile.vehicleCondition,
-    identificationMark: item.identificationMark || profile.identificationMark,
-  };
-};
+const buildImagePickerOptions = (cropMode) => ({
+  allowsEditing: true,
+  aspect: cropModes[cropMode]?.aspect || cropModes.plate.aspect,
+  quality: 0.86,
+  base64: true,
+  exif: false,
+});
 
 const formatDate = (value) => {
   if (!value) return 'Recent';
@@ -135,6 +83,8 @@ const formatDate = (value) => {
 
 export default function VehicleScanScreen({ navigation }) {
   const [imageAsset, setImageAsset] = useState(null);
+  const [cropMode, setCropMode] = useState('plate');
+  const [lastImageSource, setLastImageSource] = useState('camera');
   const [note, setNote] = useState('');
   const [loading, setLoading] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(true);
@@ -170,6 +120,8 @@ export default function VehicleScanScreen({ navigation }) {
 
   const pickImage = async (source) => {
     try {
+      const pickerOptions = buildImagePickerOptions(cropMode);
+
       if (source === 'camera') {
         const permission = await ImagePicker.requestCameraPermissionsAsync();
         if (permission.status !== 'granted') {
@@ -186,16 +138,10 @@ export default function VehicleScanScreen({ navigation }) {
 
       const result =
         source === 'camera'
-          ? await ImagePicker.launchCameraAsync({
-              allowsEditing: false,
-              quality: 1,
-              base64: true,
-            })
+          ? await ImagePicker.launchCameraAsync(pickerOptions)
           : await ImagePicker.launchImageLibraryAsync({
               mediaTypes: ImagePicker.MediaTypeOptions.Images,
-              allowsEditing: false,
-              quality: 1,
-              base64: true,
+              ...pickerOptions,
             });
 
       if (result.canceled || !result.assets?.length) {
@@ -208,7 +154,12 @@ export default function VehicleScanScreen({ navigation }) {
         return;
       }
 
-      setImageAsset(asset);
+      setImageAsset({
+        ...asset,
+        cropMode,
+        cropLabel: cropModes[cropMode]?.label || cropModes.plate.label,
+      });
+      setLastImageSource(source);
     } catch (error) {
       Alert.alert('Image Error', error.message || 'Could not open camera or gallery.');
     }
@@ -230,15 +181,32 @@ export default function VehicleScanScreen({ navigation }) {
     try {
       const dataUrl = `data:${imageAsset.mimeType || 'image/jpeg'};base64,${imageAsset.base64}`;
 
-      await vehicleObservationAPI.create({
+      const savedScan = await vehicleObservationAPI.create({
         imageDataUrl: dataUrl,
         note: note.trim(),
       });
 
-      Alert.alert('Saved', 'Vehicle details saved successfully.');
-
       resetForm();
       loadRecords({ silent: true });
+
+      const savedPlate = getVehicleFieldValue(savedScan, 'plateNumber');
+
+      Alert.alert(
+        'Saved',
+        savedPlate
+          ? `Vehicle scan saved. Plate: ${savedPlate}. Continue to vehicle journey tracking and enter the destination.`
+          : 'Vehicle scan saved. Continue to vehicle journey tracking and enter the destination.',
+        [
+          {
+            text: 'Enter Destination',
+            onPress: () =>
+              navigation.navigate('Journey', {
+                mode: 'vehicle',
+                linkedVehicleScan: savedScan,
+              }),
+          },
+        ]
+      );
     } catch (error) {
       Alert.alert('Save Failed', error.message || 'Could not save the vehicle scan.');
     } finally {
@@ -272,12 +240,51 @@ export default function VehicleScanScreen({ navigation }) {
           <Text style={styles.heroEyebrow}>Number plate scan</Text>
           <Text style={styles.heroTitle}>Scan a vehicle and view key details</Text>
           <Text style={styles.heroText}>
-            Upload a clear vehicle image to view the essential details you need most:
-            plate number, driver name, and driver phone.
+            Crop around the number plate with a little space on every side, or use vehicle crop
+            when the plate is missing or unclear.
           </Text>
         </View>
 
         <View style={styles.card}>
+          <View style={styles.cropModeRow}>
+            {Object.entries(cropModes).map(([key, item]) => {
+              const isSelected = cropMode === key;
+
+              return (
+                <TouchableOpacity
+                  key={key}
+                  style={[styles.cropModeButton, isSelected && styles.cropModeButtonActive]}
+                  onPress={() => setCropMode(key)}
+                  disabled={loading}
+                >
+                  <Ionicons
+                    name={item.icon}
+                    size={17}
+                    color={isSelected ? '#fff' : '#7b57d1'}
+                  />
+                  <View style={styles.cropModeCopy}>
+                    <Text
+                      style={[
+                        styles.cropModeTitle,
+                        isSelected && styles.cropModeTitleActive,
+                      ]}
+                    >
+                      {item.label}
+                    </Text>
+                    <Text
+                      style={[
+                        styles.cropModeHelper,
+                        isSelected && styles.cropModeHelperActive,
+                      ]}
+                    >
+                      {item.helper}
+                    </Text>
+                  </View>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+
           <View style={styles.actionRow}>
             <TouchableOpacity style={styles.actionButton} onPress={() => pickImage('camera')}>
               <Ionicons name="camera-outline" size={18} color="#fff" />
@@ -291,13 +298,40 @@ export default function VehicleScanScreen({ navigation }) {
           </View>
 
           {imageAsset?.uri ? (
-            <Image source={{ uri: imageAsset.uri }} style={styles.previewImage} />
+            <View style={styles.previewWrap}>
+              <Image source={{ uri: imageAsset.uri }} style={styles.previewImage} resizeMode="cover" />
+              <View style={styles.cropBadge}>
+                <Ionicons name="crop-outline" size={13} color="#fff" />
+                <Text style={styles.cropBadgeText}>{imageAsset.cropLabel || 'Cropped'}</Text>
+              </View>
+            </View>
           ) : (
             <View style={styles.emptyPreview}>
               <Ionicons name="image-outline" size={28} color="#b7aad8" />
               <Text style={styles.emptyPreviewText}>No image selected yet</Text>
             </View>
           )}
+
+          {imageAsset?.uri ? (
+            <View style={styles.previewActionRow}>
+              <TouchableOpacity
+                style={styles.previewActionButton}
+                onPress={() => pickImage(lastImageSource)}
+                disabled={loading}
+              >
+                <Ionicons name="crop-outline" size={16} color="#7b57d1" />
+                <Text style={styles.previewActionText}>Crop Again</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.removeImageButton}
+                onPress={() => setImageAsset(null)}
+                disabled={loading}
+              >
+                <Ionicons name="close-outline" size={17} color="#ef4444" />
+                <Text style={styles.removeImageText}>Remove</Text>
+              </TouchableOpacity>
+            </View>
+          ) : null}
 
           <View style={styles.autoFillCard}>
             <View style={styles.autoFillIconWrap}>
@@ -306,7 +340,8 @@ export default function VehicleScanScreen({ navigation }) {
             <View style={styles.autoFillCopy}>
               <Text style={styles.autoFillTitle}>Focused result</Text>
               <Text style={styles.autoFillText}>
-                Each scan keeps the result simple and focused on the most important vehicle details.
+                Use Plate Crop with room around the plate edges. If the plate is not readable, the
+                scan saves only visible vehicle clues.
               </Text>
             </View>
           </View>
@@ -339,7 +374,7 @@ export default function VehicleScanScreen({ navigation }) {
         <View style={styles.card}>
           <Text style={styles.sectionTitle}>Recent Vehicle Scans</Text>
           <Text style={styles.sectionSubtitle}>
-            Review recent scans with the essential driver and plate details.
+            Review recent scans with plate text and visible vehicle clues only.
           </Text>
 
           {historyLoading ? (
@@ -358,14 +393,17 @@ export default function VehicleScanScreen({ navigation }) {
 
           {!historyLoading &&
             records.map((record) => {
-              const item = enrichVehicleRecord(record);
+              const item = record;
+              const vehicleMeta = ['vehicleType', 'vehicleBrand', 'vehicleModel', 'vehicleColor']
+                .map((key) => getVehicleFieldValue(item, key))
+                .filter(Boolean);
 
               return (
                 <View key={item.id} style={styles.recordCard}>
                   <View style={styles.recordHeader}>
                     <View style={styles.recordTitleWrap}>
                       <Text style={styles.recordTitle}>
-                        {item.vehicleType || 'Vehicle'} record
+                        {getVehicleFieldValue(item, 'vehicleType') || 'Vehicle'} record
                       </Text>
                       <Text style={styles.recordTime}>{formatDate(item.createdAt)}</Text>
                     </View>
@@ -390,22 +428,17 @@ export default function VehicleScanScreen({ navigation }) {
                       </Text>
                     </View>
                   </View>
-                  <Text style={styles.recordMeta}>
-                    {[
-                      item.vehicleType || 'Unknown type',
-                      item.vehicleBrand || 'Unknown brand',
-                      item.vehicleModel || 'Unknown model',
-                      item.vehicleColor || 'Unknown color',
-                    ].join(' | ')}
-                  </Text>
+                  {vehicleMeta.length ? (
+                    <Text style={styles.recordMeta}>{vehicleMeta.join(' | ')}</Text>
+                  ) : null}
                   {isNoPlateRecord(item) ? (
                     <Text style={styles.noPlateHint}>
-                      This scan keeps only visible vehicle clues and avoids guessing a plate or driver.
+                      This scan keeps only visible vehicle clues and avoids guessing a plate.
                     </Text>
                   ) : null}
                   <View style={styles.highlightRow}>
                     {highlightFields.map(([key, label]) => {
-                      const value = item[key] || item.vehicleDetails?.[key];
+                      const value = getVehicleFieldValue(item, key);
 
                       if (!value) {
                         return null;
@@ -423,7 +456,7 @@ export default function VehicleScanScreen({ navigation }) {
                   </View>
                   <View style={styles.detailsGrid}>
                     {vehicleDetailFields.map(([key, label]) => {
-                      const value = item[key] || item.vehicleDetails?.[key];
+                      const value = getVehicleFieldValue(item, key);
 
                       if (!value) {
                         return null;
@@ -515,6 +548,48 @@ const styles = StyleSheet.create({
     shadowRadius: 16,
     elevation: 3,
   },
+  cropModeRow: {
+    flexDirection: 'row',
+    gap: 10,
+    marginBottom: 12,
+  },
+  cropModeButton: {
+    flex: 1,
+    minHeight: 58,
+    borderRadius: 18,
+    backgroundColor: '#f7f3ff',
+    borderWidth: 1,
+    borderColor: '#eadfff',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  cropModeButtonActive: {
+    backgroundColor: '#7b57d1',
+    borderColor: '#7b57d1',
+  },
+  cropModeCopy: {
+    flex: 1,
+  },
+  cropModeTitle: {
+    color: '#34235f',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  cropModeTitleActive: {
+    color: '#fff',
+  },
+  cropModeHelper: {
+    marginTop: 2,
+    color: '#7b7190',
+    fontSize: 10,
+    fontWeight: '700',
+  },
+  cropModeHelperActive: {
+    color: '#e7ddff',
+  },
   actionRow: {
     flexDirection: 'row',
     gap: 10,
@@ -549,12 +624,34 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '800',
   },
-  previewImage: {
+  previewWrap: {
     width: '100%',
-    height: 220,
+    height: 190,
     borderRadius: 20,
     marginTop: 14,
     backgroundColor: '#f2edf9',
+    overflow: 'hidden',
+  },
+  previewImage: {
+    width: '100%',
+    height: '100%',
+  },
+  cropBadge: {
+    position: 'absolute',
+    left: 12,
+    bottom: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    borderRadius: 999,
+    backgroundColor: 'rgba(31, 21, 51, 0.82)',
+  },
+  cropBadgeText: {
+    color: '#fff',
+    fontSize: 11,
+    fontWeight: '800',
   },
   emptyPreview: {
     marginTop: 14,
@@ -568,6 +665,41 @@ const styles = StyleSheet.create({
     marginTop: 8,
     color: '#8f8f96',
     fontWeight: '700',
+  },
+  previewActionRow: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 10,
+  },
+  previewActionButton: {
+    flex: 1,
+    minHeight: 44,
+    borderRadius: 16,
+    backgroundColor: '#f1e9ff',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 7,
+  },
+  previewActionText: {
+    color: '#7b57d1',
+    fontSize: 12,
+    fontWeight: '800',
+  },
+  removeImageButton: {
+    flex: 1,
+    minHeight: 44,
+    borderRadius: 16,
+    backgroundColor: '#fff1f2',
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 7,
+  },
+  removeImageText: {
+    color: '#ef4444',
+    fontSize: 12,
+    fontWeight: '800',
   },
   autoFillCard: {
     marginTop: 14,

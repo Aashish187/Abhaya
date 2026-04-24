@@ -48,6 +48,7 @@ const ARRIVAL_THRESHOLD_METRES = 80;
 const STATIONARY_RADIUS_METRES = 50;
 const STATIONARY_REMINDER_MS = 5 * 60 * 1000;
 const STATIONARY_CHECK_INTERVAL_MS = 10 * 1000;
+const WALKING_LOCATION_LOG_INTERVAL_MS = 60 * 1000;
 const GPS_MAX_ACCEPTABLE_ACCURACY_METRES = 120;
 const ACTIVE_JOURNEY_KEY = '@abhaya_active_journey';
 const ZONE_ALERT_COOLDOWN_MS = 45 * 1000;
@@ -165,6 +166,32 @@ const formatZoneDistance = (distance) =>
       : `${(distance / 1000).toFixed(1)} km away`
     : 'Distance unavailable';
 
+const unavailableVehicleValuePattern = /^(unknown\b.*|not available|plate not readable|plate not detected|-|n\/a)$/i;
+const isDisplayableVehicleValue = (value) => {
+  const text = String(value || '').trim();
+  return Boolean(text) && !unavailableVehicleValuePattern.test(text);
+};
+
+const getVehicleFieldValue = (vehicle, key) => {
+  const value = vehicle?.[key] || vehicle?.vehicleDetails?.[key];
+  return isDisplayableVehicleValue(value) ? String(value).trim() : '';
+};
+
+const buildVehicleHistorySummary = (vehicle) => {
+  if (!vehicle) {
+    return null;
+  }
+
+  return {
+    vehicleScanId: vehicle.id || null,
+    plateNumber: getVehicleFieldValue(vehicle, 'plateNumber') || null,
+    vehicleType: getVehicleFieldValue(vehicle, 'vehicleType') || null,
+    vehicleBrand: getVehicleFieldValue(vehicle, 'vehicleBrand') || null,
+    vehicleModel: getVehicleFieldValue(vehicle, 'vehicleModel') || null,
+    vehicleColor: getVehicleFieldValue(vehicle, 'vehicleColor') || null,
+  };
+};
+
 const SAFE_DEVIATION_REASON_OPTIONS = [
   'Taking a shortcut',
   'Avoiding traffic',
@@ -240,12 +267,8 @@ const classifySafeDeviationReason = (reason) => {
 export default function JourneyScreen({ navigation, route: screenRoute }) {
   const { user } = useAuth();
   const { setLatestReport } = useReport();
-  const isWalkingMode = screenRoute?.params?.mode === 'walking';
-  const trackerTitle = isWalkingMode ? 'Walking Guardian' : 'Journey Guardian';
-  const destinationCardTitle = isWalkingMode ? 'Walking Destination' : 'Destination';
-  const destinationCardSubtitle = isWalkingMode
-    ? 'Enter only the destination. Abhaya will monitor the walk, save a 5 minute location trail, and stop automatically when you arrive.'
-    : 'Enter the destination once. Abhaya suggests routes, then starts safety monitoring after you choose one.';
+  const routedVehicleScan = screenRoute?.params?.linkedVehicleScan || null;
+  const requestedMode = screenRoute?.params?.mode || null;
   const mapRef = useRef(null);
   const watchSubscriptionRef = useRef(null);
   const checkIntervalRef = useRef(null);
@@ -318,6 +341,48 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
   const [nearbyCrimeZones, setNearbyCrimeZones] = useState([]);
   const [mapRegion, setMapRegion] = useState(DEFAULT_REGION);
   const lastWalkingLogAtRef = useRef(0);
+  const isVehicleScanMode = requestedMode === 'vehicle';
+  const linkedVehicleScan = isVehicleScanMode ? routedVehicleScan || latestVehicleScan : null;
+  const vehicleHistorySummary = useMemo(
+    () => buildVehicleHistorySummary(linkedVehicleScan),
+    [linkedVehicleScan]
+  );
+  const linkedVehicleDisplay = useMemo(() => {
+    if (!linkedVehicleScan) {
+      return null;
+    }
+
+    const plateNumber = getVehicleFieldValue(linkedVehicleScan, 'plateNumber');
+    const vehicleType = getVehicleFieldValue(linkedVehicleScan, 'vehicleType');
+    const vehicleBrand = getVehicleFieldValue(linkedVehicleScan, 'vehicleBrand');
+    const vehicleModel = getVehicleFieldValue(linkedVehicleScan, 'vehicleModel');
+    const vehicleColor = getVehicleFieldValue(linkedVehicleScan, 'vehicleColor');
+    const identificationMark = getVehicleFieldValue(linkedVehicleScan, 'identificationMark');
+
+    return {
+      title: plateNumber || vehicleType || 'Scanned vehicle',
+      meta: [vehicleType, vehicleBrand, vehicleModel, vehicleColor].filter(Boolean),
+      infoCards: [
+        ['Plate Number', plateNumber],
+        ['Vehicle Type', vehicleType],
+        ['Brand', vehicleBrand],
+        ['Model', vehicleModel],
+        ['Color', vehicleColor],
+        ['Visible Mark', identificationMark],
+      ].filter(([, value]) => Boolean(value)),
+    };
+  }, [linkedVehicleScan]);
+  const isWalkingMode = !isVehicleScanMode;
+  const journeyMode = isWalkingMode ? 'walking' : 'vehicle';
+  const trackerTitle = isWalkingMode ? 'Walking Guardian' : 'Auto/Vehicle Guardian';
+  const destinationCardTitle = isWalkingMode ? 'Walking Destination' : 'Vehicle Journey Destination';
+  const destinationCardSubtitle = isWalkingMode
+    ? 'Enter only the destination and Abhaya will monitor the walk with 1 minute location logs.'
+    : vehicleHistorySummary
+      ? vehicleHistorySummary.plateNumber
+        ? `Vehicle scan is linked (${vehicleHistorySummary.plateNumber}). Enter the destination to track this auto/vehicle journey.`
+        : 'Vehicle scan is linked. Enter the destination to track this auto/vehicle journey.'
+      : 'Vehicle scan mode is active. Enter the destination to track this auto/vehicle journey.';
 
   const routeCoordinates = useMemo(
     () => route.map(toMapCoordinate),
@@ -540,7 +605,7 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
           event: isWalkingMode ? 'walking_started' : 'journey_started',
           message: isWalkingMode
             ? `Started walking monitor to ${destinationName}`
-            : `Started monitoring route to ${destinationName}`,
+            : `Started auto/vehicle journey to ${destinationName}`,
           summary: {
             destinationName,
             destinationLat: destination?.lat,
@@ -550,12 +615,27 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
             eta: 0,
             distanceKm: 0,
             selectedRouteIndex: 0,
+            journeyMode,
+            ...(vehicleHistorySummary || {}),
           },
         });
 
         if (result?.id) {
           activeHistoryIdRef.current = result.id;
           setActiveHistoryId(result.id);
+
+          if (vehicleHistorySummary) {
+            const scanLinkedMessage = vehicleHistorySummary.plateNumber
+              ? `Linked scanned vehicle: ${vehicleHistorySummary.plateNumber}`
+              : 'Linked scanned vehicle';
+
+            await journeyAPI.addHistoryEvent({
+              historyId: result.id,
+              type: 'vehicle_scan_linked',
+              message: scanLinkedMessage,
+              metadata: vehicleHistorySummary,
+            });
+          }
 
           await journeyAPI.updateHistory({
             historyId: result.id,
@@ -572,7 +652,7 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
 
       Alert.alert(isWalkingMode ? 'Walk Complete' : 'Journey Complete', `${completionMessage} Tracking has been stopped.`);
     },
-    [isWalkingMode, resetJourney]
+    [isWalkingMode, journeyMode, resetJourney, vehicleHistorySummary]
   );
 
   useEffect(() => {
@@ -695,6 +775,12 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
     }, [loadLatestVehicleScan])
   );
 
+  useEffect(() => {
+    if (routedVehicleScan) {
+      setLatestVehicleScan(routedVehicleScan);
+    }
+  }, [routedVehicleScan]);
+
   const smoothPosition = useCallback((rawPosition) => {
     const buffer = smoothingBufferRef.current;
     buffer.push(rawPosition);
@@ -812,7 +898,9 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
   const buildJourneyIncidentReport = useCallback(
     async (reason) => {
       const position = latestPositionRef.current;
-      const linkedVehicle = latestVehicleScan || vehicleObservations[vehicleObservations.length - 1] || null;
+      const linkedVehicle = vehicleHistorySummary
+        ? linkedVehicleScan
+        : vehicleObservations[vehicleObservations.length - 1] || null;
       const triggerType =
         String(reason || '').includes('stationary') ? 'Stationary Alert SOS' : 'Journey SOS';
       let resolvedAddress = '';
@@ -836,7 +924,7 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
         user: {
           name: user?.displayName || user?.name || 'Abhaya User',
           phone:
-            user?.phone || user?.phoneNumber || user?.mobile || user?.contact || 'Not available',
+            user?.phone || user?.phoneNumber || user?.mobile || user?.contact || '',
           email: user?.email || '',
         },
         trigger: {
@@ -854,28 +942,12 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
         },
         vehicle: linkedVehicle
           ? {
-              driverName: linkedVehicle.driverName || linkedVehicle.vehicleDetails?.driverName || '',
-              driverPhone: linkedVehicle.driverPhone || linkedVehicle.vehicleDetails?.driverPhone || '',
-              plateNumber: linkedVehicle.plateNumber || linkedVehicle.vehicleDetails?.plateNumber || '',
-              vehicleType: linkedVehicle.vehicleType || linkedVehicle.vehicleDetails?.vehicleType || '',
-              vehicleBrand: linkedVehicle.vehicleBrand || linkedVehicle.vehicleDetails?.vehicleBrand || '',
-              vehicleModel: linkedVehicle.vehicleModel || linkedVehicle.vehicleDetails?.vehicleModel || '',
-              vehicleColor: linkedVehicle.vehicleColor || linkedVehicle.vehicleDetails?.vehicleColor || '',
-              identificationMark:
-                linkedVehicle.identificationMark ||
-                linkedVehicle.vehicleDetails?.identificationMark ||
-                '',
-              ownerName: linkedVehicle.ownerName || linkedVehicle.vehicleDetails?.ownerName || '',
-              operatorName:
-                linkedVehicle.operatorName || linkedVehicle.vehicleDetails?.operatorName || '',
-              registrationZone:
-                linkedVehicle.registrationZone ||
-                linkedVehicle.vehicleDetails?.registrationZone ||
-                '',
-              vehicleCondition:
-                linkedVehicle.vehicleCondition ||
-                linkedVehicle.vehicleDetails?.vehicleCondition ||
-                '',
+              plateNumber: getVehicleFieldValue(linkedVehicle, 'plateNumber'),
+              vehicleType: getVehicleFieldValue(linkedVehicle, 'vehicleType'),
+              vehicleBrand: getVehicleFieldValue(linkedVehicle, 'vehicleBrand'),
+              vehicleModel: getVehicleFieldValue(linkedVehicle, 'vehicleModel'),
+              vehicleColor: getVehicleFieldValue(linkedVehicle, 'vehicleColor'),
+              identificationMark: getVehicleFieldValue(linkedVehicle, 'identificationMark'),
             }
           : null,
         evidence: [],
@@ -885,8 +957,8 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
           `SOS sent from journey screen: ${reason}`,
           selectedDestination?.displayName
             ? `Destination selected: ${selectedDestination.displayName}`
-            : 'Destination not available',
-        ],
+            : '',
+        ].filter(Boolean),
         notification: {
           sent: true,
         },
@@ -895,7 +967,7 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
     [
       activeCrimeZone?.name,
       activeCrimeZone?.risk,
-      latestVehicleScan,
+      linkedVehicleScan,
       selectedDestination?.displayName,
       setLatestReport,
       user?.contact,
@@ -906,6 +978,7 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
       user?.phone,
       user?.phoneNumber,
       vehicleObservations,
+      vehicleHistorySummary,
     ]
   );
 
@@ -1433,52 +1506,54 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
     }
   }, [completeJourney, currentPosition, isTracking, isWalkingMode, selectedDestination]);
 
-  useEffect(() => {
-    if (!isWalkingMode || !isTracking || !currentPosition || route.length <= 1) {
+  const saveWalkingCheckpoint = useCallback(async () => {
+    const position = latestPositionRef.current;
+
+    if (!position || !selectedDestination || !activeHistoryIdRef.current) {
       return;
     }
 
     const now = Date.now();
-    if (now - lastWalkingLogAtRef.current < 5 * 60 * 1000) {
+    if (now - lastWalkingLogAtRef.current < WALKING_LOCATION_LOG_INTERVAL_MS) {
       return;
     }
 
-    let active = true;
+    lastWalkingLogAtRef.current = now;
 
-    const saveWalkingCheckpoint = async () => {
-      let resolvedAddress = '';
+    let resolvedAddress = '';
 
-      try {
-        const results = await Location.reverseGeocodeAsync({
-          latitude: currentPosition.latitude,
-          longitude: currentPosition.longitude,
-        });
-        resolvedAddress = formatResolvedAddress(Array.isArray(results) ? results[0] : null);
-      } catch {
-        resolvedAddress = '';
-      }
-
-      if (!active) {
-        return;
-      }
-
-      lastWalkingLogAtRef.current = now;
-      await addJourneyLog({
-        type: 'walking_location_logged',
-        message: `Walking location saved after 5 minutes near ${resolvedAddress || 'current position'}`,
-        metadata: {
-          address: resolvedAddress || null,
-          destinationName: selectedDestination?.displayName || null,
-        },
+    try {
+      const results = await Location.reverseGeocodeAsync({
+        latitude: position.latitude,
+        longitude: position.longitude,
       });
-    };
+      resolvedAddress = formatResolvedAddress(Array.isArray(results) ? results[0] : null);
+    } catch {
+      resolvedAddress = '';
+    }
 
-    saveWalkingCheckpoint();
+    await addJourneyLog({
+      type: 'walking_location_logged',
+      message: `Near to ${resolvedAddress || 'current position'}`,
+      metadata: {
+        address: resolvedAddress || null,
+        destinationName: selectedDestination.displayName || null,
+        intervalSeconds: WALKING_LOCATION_LOG_INTERVAL_MS / 1000,
+      },
+    });
+  }, [addJourneyLog, selectedDestination]);
+
+  useEffect(() => {
+    if (!isWalkingMode || !isTracking || route.length <= 1) {
+      return undefined;
+    }
+
+    const intervalId = setInterval(saveWalkingCheckpoint, WALKING_LOCATION_LOG_INTERVAL_MS);
 
     return () => {
-      active = false;
+      clearInterval(intervalId);
     };
-  }, [addJourneyLog, currentPosition, isTracking, isWalkingMode, route.length, selectedDestination?.displayName]);
+  }, [isTracking, isWalkingMode, route.length, saveWalkingCheckpoint]);
 
   useEffect(() => {
     if (!isTracking || !currentPosition) {
@@ -1617,7 +1692,7 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
             event: isWalkingMode ? 'walking_started' : 'journey_started',
             message: isWalkingMode
               ? `Started walking monitor to ${destination.displayName}`
-              : `Started monitoring route to ${destination.displayName}`,
+              : `Started auto/vehicle journey to ${destination.displayName}`,
             summary: {
               destinationName: destination.displayName,
               destinationLat: destination.lat,
@@ -1627,12 +1702,27 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
               eta: routeData.eta,
               distanceKm: routeData.distance_km,
               selectedRouteIndex: selectedIndex,
+              journeyMode,
+              ...(vehicleHistorySummary || {}),
             },
           });
 
           if (result?.id) {
             activeHistoryIdRef.current = result.id;
             setActiveHistoryId(result.id);
+
+            if (vehicleHistorySummary) {
+              const scanLinkedMessage = vehicleHistorySummary.plateNumber
+                ? `Linked scanned vehicle: ${vehicleHistorySummary.plateNumber}`
+                : 'Linked scanned vehicle';
+
+              await journeyAPI.addHistoryEvent({
+                historyId: result.id,
+                type: 'vehicle_scan_linked',
+                message: scanLinkedMessage,
+                metadata: vehicleHistorySummary,
+              });
+            }
 
             await journeyAPI.addHistoryEvent({
               historyId: result.id,
@@ -1658,7 +1748,16 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
         setJourneyError('Route selected, but journey history could not be saved.');
       }
     },
-    [addJourneyLog, fitMapToRoute, isWalkingMode, journeyStart, resetDeviationState, routeOptions]
+    [
+      addJourneyLog,
+      fitMapToRoute,
+      isWalkingMode,
+      journeyMode,
+      journeyStart,
+      resetDeviationState,
+      routeOptions,
+      vehicleHistorySummary,
+    ]
   );
 
   const planRouteToDestination = useCallback(
@@ -1725,6 +1824,7 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
               originLng: position.longitude,
               destLat: candidate.lat,
               destLng: candidate.lng,
+              mode: journeyMode,
             });
             resolvedDestination = candidate;
             break;
@@ -1790,6 +1890,7 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
       resetDeviationState,
       searchResults,
       stopDeviationChecks,
+      journeyMode,
     ]
   );
 
@@ -2093,11 +2194,13 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
       </View>
 
       <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
-        {!isWalkingMode && selectedDestination ? (
+        {!isWalkingMode ? (
           <View style={styles.card}>
             <Text style={styles.cardTitle}>Scanned Vehicle Details</Text>
             <Text style={styles.cardSubtitle}>
-              The latest scanned vehicle details appear here while this journey is active.
+              {selectedDestination
+                ? 'This journey is linked with the scanned plate and will be saved in journey logs.'
+                : 'This journey is linked with the scanned plate. Enter a destination to start vehicle tracking.'}
             </Text>
 
             {isLoadingLatestVehicleScan ? (
@@ -2105,20 +2208,16 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
                 <ActivityIndicator size="small" color="#7b57d1" />
                 <Text style={styles.vehicleScanLoadingText}>Loading scanned vehicle...</Text>
               </View>
-            ) : latestVehicleScan ? (
+            ) : linkedVehicleScan ? (
               <View style={styles.linkedVehicleCard}>
                 <View style={styles.linkedVehicleHeader}>
                   <View>
-                    <Text style={styles.linkedVehicleTitle}>
-                      {latestVehicleScan.plateNumber || 'Plate not detected'}
-                    </Text>
-                    <Text style={styles.linkedVehicleMeta}>
-                      {[
-                        latestVehicleScan.vehicleType || 'Vehicle',
-                        latestVehicleScan.vehicleBrand || 'Unknown brand',
-                        latestVehicleScan.vehicleModel || 'Unknown model',
-                      ].join(' | ')}
-                    </Text>
+                    <Text style={styles.linkedVehicleTitle}>{linkedVehicleDisplay?.title}</Text>
+                    {linkedVehicleDisplay?.meta?.length ? (
+                      <Text style={styles.linkedVehicleMeta}>
+                        {linkedVehicleDisplay.meta.join(' | ')}
+                      </Text>
+                    ) : null}
                   </View>
                   <View style={styles.linkedVehicleBadge}>
                     <Ionicons name="shield-checkmark-outline" size={14} color="#7b57d1" />
@@ -2126,23 +2225,19 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
                   </View>
                 </View>
 
-                <View style={styles.linkedVehicleInfoGrid}>
-                  <View style={styles.linkedVehicleInfoCard}>
-                    <Text style={styles.linkedVehicleInfoLabel}>Driver Name</Text>
-                    <Text style={styles.linkedVehicleInfoValue}>
-                      {latestVehicleScan.driverName || 'Not available'}
-                    </Text>
+                {linkedVehicleDisplay?.infoCards?.length ? (
+                  <View style={styles.linkedVehicleInfoGrid}>
+                    {linkedVehicleDisplay.infoCards.map(([label, value]) => (
+                      <View key={label} style={styles.linkedVehicleInfoCard}>
+                        <Text style={styles.linkedVehicleInfoLabel}>{label}</Text>
+                        <Text style={styles.linkedVehicleInfoValue}>{value}</Text>
+                      </View>
+                    ))}
                   </View>
-                  <View style={styles.linkedVehicleInfoCard}>
-                    <Text style={styles.linkedVehicleInfoLabel}>Driver Phone</Text>
-                    <Text style={styles.linkedVehicleInfoValue}>
-                      {latestVehicleScan.driverPhone || 'Not available'}
-                    </Text>
-                  </View>
-                </View>
+                ) : null}
 
-                {latestVehicleScan.note ? (
-                  <Text style={styles.linkedVehicleNote}>{latestVehicleScan.note}</Text>
+                {linkedVehicleScan.note ? (
+                  <Text style={styles.linkedVehicleNote}>{linkedVehicleScan.note}</Text>
                 ) : null}
               </View>
             ) : (
@@ -2260,7 +2355,7 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
         </View>
 
         <View style={styles.card}>
-          <Text style={styles.cardTitle}>{isWalkingMode ? 'Live Walk' : 'Live Journey'}</Text>
+          <Text style={styles.cardTitle}>{isWalkingMode ? 'Live Walk' : 'Live Auto/Vehicle Journey'}</Text>
 
           {activeCrimeZone ? (
             <View
@@ -2468,7 +2563,7 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
               <Text style={styles.cardTitle}>{isWalkingMode ? 'Suggested Walking Routes' : 'Suggested Safe Routes'}</Text>
               <Text style={styles.cardSubtitle}>
                 {isWalkingMode
-                  ? 'Choose the walking route. Monitoring starts automatically after selection and saves a location log every 5 minutes.'
+                  ? 'Choose the walking route. Monitoring starts automatically after selection and saves a location log every 1 minute.'
                   : 'Choose the route she is taking. Monitoring starts automatically after selection.'}
               </Text>
 

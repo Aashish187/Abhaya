@@ -36,8 +36,14 @@ const formatTimelineType = (value) =>
     .replace(/_/g, ' ')
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
 
+const unavailableValuePattern = /^(unknown\b.*|not available|plate not readable|plate not detected|-|n\/a)$/i;
+const isDisplayableValue = (value) => {
+  const text = String(value || '').trim();
+  return Boolean(text) && !unavailableValuePattern.test(text);
+};
+
 const firstAvailable = (...values) =>
-  values.find((value) => String(value || '').trim()) || '';
+  values.find(isDisplayableValue) || '';
 
 const normalizePhone = (value) => String(value || '').replace(/[^\d+]/g, '');
 
@@ -72,15 +78,9 @@ const getMapLink = (location) => {
 
 const hasVehicleContent = (vehicleDetails) =>
   Boolean(
-    vehicleDetails?.driverName ||
-      vehicleDetails?.driverPhone ||
-      vehicleDetails?.plateNumber ||
-      vehicleDetails?.vehicleSummary ||
-      vehicleDetails?.identificationMark ||
-      vehicleDetails?.ownerName ||
-      vehicleDetails?.operatorName ||
-      vehicleDetails?.registrationZone ||
-      vehicleDetails?.vehicleCondition
+    isDisplayableValue(vehicleDetails?.plateNumber) ||
+      isDisplayableValue(vehicleDetails?.vehicleSummary) ||
+      isDisplayableValue(vehicleDetails?.identificationMark)
   );
 
 const buildReportMessage = ({
@@ -90,26 +90,28 @@ const buildReportMessage = ({
   includeVehicleDetails,
   resolvedLocationAddress,
 }) => {
-  const lines = [
-    'ABHAYA INCIDENT REPORT',
-    `Incident ID: ${report?.incidentId || '-'}`,
-    `Reported At: ${formatTimestamp(report?.createdAt)}`,
-    `Status: ${report?.status || 'ACTIVE'}`,
-    `Triggered By: ${report?.trigger?.type || 'SOS'}`,
-    `Risk Score: ${report?.trigger?.riskScore || 'HIGH'}`,
-    `User Name: ${report?.user?.name || '-'}`,
-    `User Phone: ${report?.user?.phone || '-'}`,
-    `Location Address: ${resolvedLocationAddress || report?.location?.address || '-'}`,
-    `Latitude: ${formatCoordinate(report?.location?.lat)}`,
-    `Longitude: ${formatCoordinate(report?.location?.lng)}`,
-  ];
+  const lines = ['ABHAYA INCIDENT REPORT'];
+  const addLine = (label, value) => {
+    if (isDisplayableValue(value)) {
+      lines.push(`${label}: ${String(value).trim()}`);
+    }
+  };
+
+  addLine('Incident ID', report?.incidentId);
+  addLine('Reported At', formatTimestamp(report?.createdAt));
+  addLine('Status', report?.status || 'ACTIVE');
+  addLine('Triggered By', report?.trigger?.type || 'SOS');
+  addLine('Risk Score', report?.trigger?.riskScore || 'HIGH');
+  addLine('User Name', report?.user?.name);
+  addLine('User Phone', report?.user?.phone);
+  addLine('Location Address', resolvedLocationAddress || report?.location?.address);
+  addLine('Latitude', formatCoordinate(report?.location?.lat));
+  addLine('Longitude', formatCoordinate(report?.location?.lng));
 
   if (includeVehicleDetails) {
-    lines.push(`Driver Name: ${vehicleDetails.driverName || '-'}`);
-    lines.push(`Driver Phone: ${vehicleDetails.driverPhone || '-'}`);
-    lines.push(`Plate Number: ${vehicleDetails.plateNumber || '-'}`);
-    lines.push(`Vehicle: ${vehicleDetails.vehicleSummary || '-'}`);
-    lines.push(`Visible Mark: ${vehicleDetails.identificationMark || '-'}`);
+    addLine('Plate Number', vehicleDetails.plateNumber);
+    addLine('Vehicle', vehicleDetails.vehicleSummary);
+    addLine('Visible Mark', vehicleDetails.identificationMark);
   }
 
   if (mapLink) {
@@ -119,12 +121,18 @@ const buildReportMessage = ({
   return lines.join('\n');
 };
 
-const ReportMetricRow = ({ label, value, valueStyle }) => (
-  <View style={styles.metricRow}>
-    <Text style={styles.metricLabel}>{label}</Text>
-    <Text style={[styles.metricValue, valueStyle]}>{value || '-'}</Text>
-  </View>
-);
+const ReportMetricRow = ({ label, value, valueStyle }) => {
+  if (!isDisplayableValue(value)) {
+    return null;
+  }
+
+  return (
+    <View style={styles.metricRow}>
+      <Text style={styles.metricLabel}>{label}</Text>
+      <Text style={[styles.metricValue, valueStyle]}>{value}</Text>
+    </View>
+  );
+};
 
 const SectionCard = ({ iconName, iconColor, title, subtitle, children }) => (
   <View style={styles.card}>
@@ -247,22 +255,10 @@ export default function ReportDetailsScreen({ navigation, route }) {
     );
 
     return {
-      driverName: firstAvailable(vehicle.driverName, observation.driverName),
-      driverPhone: firstAvailable(vehicle.driverPhone, observation.driverPhone),
       plateNumber: firstAvailable(vehicle.plateNumber, observation.plateNumber),
-      ownerName: firstAvailable(vehicle.ownerName, observation.ownerName),
-      operatorName: firstAvailable(vehicle.operatorName, observation.operatorName),
       identificationMark: firstAvailable(
         vehicle.identificationMark,
         observation.identificationMark
-      ),
-      vehicleCondition: firstAvailable(
-        vehicle.vehicleCondition,
-        observation.vehicleCondition
-      ),
-      registrationZone: firstAvailable(
-        vehicle.registrationZone,
-        observation.registrationZone
       ),
       vehicleSummary: [vehicleType, vehicleBrand, vehicleModel, vehicleColor]
         .filter(Boolean)
@@ -323,7 +319,7 @@ export default function ReportDetailsScreen({ navigation, route }) {
   }, [report?.location?.lat, report?.location?.lng]);
 
   const resolvedLocationAddress = useMemo(
-    () => resolvedAddress || report?.location?.address || '-',
+    () => resolvedAddress || report?.location?.address || '',
     [report?.location?.address, resolvedAddress]
   );
 
@@ -408,8 +404,8 @@ export default function ReportDetailsScreen({ navigation, route }) {
   );
 
   const targetPhone = useMemo(
-    () => normalizePhone(vehicleDetails.driverPhone || report?.user?.phone),
-    [report?.user?.phone, vehicleDetails.driverPhone]
+    () => normalizePhone(report?.user?.phone),
+    [report?.user?.phone]
   );
 
   const handleOpenMap = useCallback(async () => {
@@ -495,7 +491,7 @@ export default function ReportDetailsScreen({ navigation, route }) {
             </View>
             <Text style={styles.reportHeroTitle}>Emergency Incident Summary</Text>
             <Text style={styles.reportHeroSubtitle}>
-              Structured report containing user, vehicle, driver, location, evidence, and send-ready details.
+              Structured report containing user, vehicle, location, evidence, and send-ready details.
             </Text>
 
             <View style={styles.heroActionRow}>
@@ -529,29 +525,24 @@ export default function ReportDetailsScreen({ navigation, route }) {
             title="User Information"
             subtitle="Primary details of the person who triggered the report"
           >
-            <ReportMetricRow label="User Name" value={report.user?.name || '-'} />
-            <ReportMetricRow label="User Phone" value={report.user?.phone || '-'} />
+            <ReportMetricRow label="User Name" value={report.user?.name} />
+            <ReportMetricRow label="User Phone" value={report.user?.phone} />
           </SectionCard>
 
           {shouldShowVehicleSection ? (
             <SectionCard
               iconName="car-outline"
               iconColor="#ea5455"
-              title="Driver & Vehicle Information"
+              title="Vehicle Information"
               subtitle={
                 isJourneyLinkedReport
                   ? 'Pulled from journey-linked report data and latest saved vehicle scan when available'
                   : 'Shown only when this report already includes vehicle details'
               }
             >
-              <ReportMetricRow label="Driver Name" value={vehicleDetails.driverName || '-'} />
-              <ReportMetricRow label="Driver Phone" value={vehicleDetails.driverPhone || '-'} />
-              <ReportMetricRow label="Plate Number" value={vehicleDetails.plateNumber || '-'} />
-              <ReportMetricRow label="Vehicle" value={vehicleDetails.vehicleSummary || '-'} />
-              <ReportMetricRow label="Visible Mark" value={vehicleDetails.identificationMark || '-'} />
-              <ReportMetricRow label="Owner / Operator" value={firstAvailable(vehicleDetails.ownerName, vehicleDetails.operatorName) || '-'} />
-              <ReportMetricRow label="Registration Zone" value={vehicleDetails.registrationZone || '-'} />
-              <ReportMetricRow label="Vehicle Condition" value={vehicleDetails.vehicleCondition || '-'} />
+              <ReportMetricRow label="Plate Number" value={vehicleDetails.plateNumber} />
+              <ReportMetricRow label="Vehicle" value={vehicleDetails.vehicleSummary} />
+              <ReportMetricRow label="Visible Mark" value={vehicleDetails.identificationMark} />
             </SectionCard>
           ) : null}
 
@@ -625,13 +616,15 @@ export default function ReportDetailsScreen({ navigation, route }) {
               </TouchableOpacity>
             </View>
 
-            <View style={styles.reportReadyBox}>
-              <Text style={styles.reportReadyTitle}>Send-ready report target</Text>
-              <Text style={styles.reportReadyValue}>{targetPhone || 'No phone number available yet'}</Text>
-              <Text style={styles.reportReadyText}>
-                The Send Report button opens SMS for the driver phone first, otherwise the user phone, and falls back to share if SMS is unavailable.
-              </Text>
-            </View>
+            {targetPhone ? (
+              <View style={styles.reportReadyBox}>
+                <Text style={styles.reportReadyTitle}>Send-ready report target</Text>
+                <Text style={styles.reportReadyValue}>{targetPhone}</Text>
+                <Text style={styles.reportReadyText}>
+                  The Send Report button opens SMS for the user phone and falls back to share if SMS is unavailable.
+                </Text>
+              </View>
+            ) : null}
           </SectionCard>
         </ScrollView>
       )}

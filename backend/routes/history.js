@@ -27,6 +27,11 @@ const sanitizeNumber = (value) => {
   return Number.isFinite(numeric) ? numeric : null;
 };
 
+const sanitizeText = (value) => {
+  const text = String(value || '').trim();
+  return text || null;
+};
+
 const sanitizeRouteSummary = (summary = {}) => ({
   destinationName: String(summary.destinationName || ''),
   destinationLat: sanitizeNumber(summary.destinationLat),
@@ -38,6 +43,13 @@ const sanitizeRouteSummary = (summary = {}) => ({
   selectedRouteIndex: Number.isInteger(summary.selectedRouteIndex)
     ? summary.selectedRouteIndex
     : null,
+  journeyMode: sanitizeText(summary.journeyMode) || 'vehicle',
+  vehicleScanId: sanitizeText(summary.vehicleScanId),
+  plateNumber: sanitizeText(summary.plateNumber),
+  vehicleType: sanitizeText(summary.vehicleType),
+  vehicleBrand: sanitizeText(summary.vehicleBrand),
+  vehicleModel: sanitizeText(summary.vehicleModel),
+  vehicleColor: sanitizeText(summary.vehicleColor),
 });
 
 const clampLimit = (value, fallback, max) => {

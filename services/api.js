@@ -97,6 +97,8 @@ const storeAuthData = async (data) => {
         uid: data.uid,
         email: data.email,
         displayName: data.displayName,
+        photoURL: data.photoURL || '',
+        hasSafetyPassword: data.hasSafetyPassword,
       }),
     ],
   ]);
@@ -113,6 +115,20 @@ const getStoredUser = async () => {
   } catch {
     return null;
   }
+};
+
+const persistUserProfile = async (nextUser) => {
+  if (!nextUser || typeof nextUser !== 'object') {
+    return;
+  }
+
+  const existing = await getStoredUser();
+  const mergedUser = {
+    ...(existing && typeof existing === 'object' ? existing : {}),
+    ...nextUser,
+  };
+
+  await AsyncStorage.setItem(USER_KEY, JSON.stringify(mergedUser));
 };
 
 const refreshToken = async () => {
@@ -176,13 +192,26 @@ const authAPI = {
     return { success: true };
   },
 
-  getProfile: async () => apiRequest('/auth/profile', { method: 'GET' }),
+  getProfile: async () => {
+    const result = await apiRequest('/auth/profile', { method: 'GET' });
+    if (result?.success && result.data) {
+      await persistUserProfile(result.data);
+    }
+    return result;
+  },
 
-  updateProfile: async (data) =>
-    apiRequest('/auth/profile', {
+  updateProfile: async (data) => {
+    const result = await apiRequest('/auth/profile', {
       method: 'PUT',
       body: data,
-    }),
+    });
+
+    if (result?.success && result.data) {
+      await persistUserProfile(result.data);
+    }
+
+    return result;
+  },
 
   deleteAccount: async () => {
     const result = await apiRequest('/auth/account', { method: 'DELETE' });

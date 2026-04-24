@@ -34,6 +34,24 @@ const statusColor = {
   ended: '#f97316',
 };
 
+const getModeLabel = (item) =>
+  item?.journeyMode === 'walking' ? 'Walking' : 'Auto/Vehicle';
+
+const getVehicleLine = (item) => {
+  if (item?.journeyMode === 'walking') {
+    return 'Destination-only walking tracking';
+  }
+
+  return [
+    item?.plateNumber ? `Plate ${item.plateNumber}` : null,
+    [item?.vehicleType, item?.vehicleBrand, item?.vehicleModel, item?.vehicleColor]
+      .filter(Boolean)
+      .join(' '),
+  ]
+    .filter(Boolean)
+    .join(' | ');
+};
+
 export default function JourneyHistoryScreen({ navigation, route }) {
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -77,7 +95,7 @@ export default function JourneyHistoryScreen({ navigation, route }) {
 
     return history.filter((item) => {
       const events = Array.isArray(item.events) ? item.events : [];
-      return events.some((event) => String(event.type || '').startsWith('walking_'));
+      return item.journeyMode === 'walking' || events.some((event) => String(event.type || '').startsWith('walking_'));
     });
   }, [history, showWalkingOnly]);
 
@@ -109,7 +127,7 @@ export default function JourneyHistoryScreen({ navigation, route }) {
           <Text style={styles.summaryTitle}>Recent route logs</Text>
           <Text style={styles.summaryText}>
             {showWalkingOnly
-              ? 'Every walking session saves destination, 5 minute location logs, deviations, stops, and final completion.'
+              ? 'Every walking session saves destination, 1 minute location logs, deviations, stops, and final completion.'
               : 'Every monitored journey saves destination, start point, route status, SOS, deviation, stationary alerts, and route switch logs.'}
           </Text>
         </View>
@@ -154,6 +172,9 @@ export default function JourneyHistoryScreen({ navigation, route }) {
                 <View style={styles.cardTitleWrap}>
                   <Text style={styles.destination} numberOfLines={2}>
                     {item.destinationName || 'Saved journey'}
+                  </Text>
+                  <Text style={styles.modeText}>
+                    {getModeLabel(item)}{getVehicleLine(item) ? ` | ${getVehicleLine(item)}` : ''}
                   </Text>
                   <Text style={styles.timestamp}>{formatDate(item.updatedAt || item.createdAt)}</Text>
                 </View>
@@ -338,6 +359,12 @@ const styles = StyleSheet.create({
     color: '#111827',
     fontSize: 15,
     fontWeight: '800',
+  },
+  modeText: {
+    marginTop: 4,
+    color: '#5b4f83',
+    fontSize: 11,
+    fontWeight: '700',
   },
   timestamp: {
     marginTop: 4,

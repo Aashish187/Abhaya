@@ -109,12 +109,13 @@ const journeyAPI = {
       method: 'GET',
     }),
 
-  fetchRoute: async ({ originLat, originLng, destLat, destLng }) => {
+  fetchRoute: async ({ originLat, originLng, destLat, destLng, mode = 'vehicle' }) => {
     const url = new URL(`${BASE_URL}/journey/route`);
     url.searchParams.set('origin_lat', originLat);
     url.searchParams.set('origin_lng', originLng);
     url.searchParams.set('dest_lat', destLat);
     url.searchParams.set('dest_lng', destLng);
+    url.searchParams.set('mode', mode);
 
     let response;
 

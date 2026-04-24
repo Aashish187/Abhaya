@@ -3,6 +3,7 @@ const path = require('path');
 const crypto = require('crypto');
 
 const express = require('express');
+const sharp = require('sharp');
 
 const { admin, adminInitialized } = require('../config/firebase');
 const { verifyToken } = require('../middleware/auth');
@@ -11,12 +12,6 @@ const logger = require('../utils/logger');
 const router = express.Router();
 
 const uploadsDir = path.join(__dirname, '..', 'uploads', 'vehicle-observations');
-const profilesFilePath = path.join(
-  __dirname,
-  '..',
-  'data',
-  'noPlateVehicleProfilesDetailed.json'
-);
 fs.mkdirSync(uploadsDir, { recursive: true });
 
 const getObservationCollection = (uid) =>
@@ -82,50 +77,9 @@ const groqApiKey = process.env.GROQ_API_KEY;
 const groqVisionModel =
   process.env.GROQ_VISION_MODEL || 'meta-llama/llama-4-scout-17b-16e-instruct';
 const groqTimeoutMs = Number(process.env.GROQ_TIMEOUT_MS || 15000);
-
-const loadNoPlateProfiles = () => {
-  try {
-    const raw = fs.readFileSync(profilesFilePath, 'utf8');
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) {
-      return [];
-    }
-
-    return parsed.map((profile, index) => ({
-      profile_id: profile.profile_id || `vehicle-profile-${index + 1}`,
-      ...profile,
-    }));
-  } catch {
-    return [];
-  }
-};
-
-const getAutoVehicleProfile = (seedText = '') => {
-  const profiles = loadNoPlateProfiles();
-  if (!profiles.length) {
-    return {
-      profile_id: 'vehicle-profile-default',
-      vehicle_type: 'Unknown Vehicle',
-      brand: 'Unknown Brand',
-      model: 'Unknown Model',
-      color: 'Unknown Color',
-      plate_number: 'No plate visible',
-      driver_name: 'Unknown Driver',
-      driver_phone: 'Unknown Phone',
-      owner_name: 'Unknown Owner',
-      operator_name: 'Unknown Operator',
-      registration_zone: 'Unknown Area',
-      fuel_type: 'Unknown Fuel',
-      seating_capacity: 'Unknown Seats',
-      vehicle_condition: 'Unknown Condition',
-      identification_mark: 'No visible mark',
-    };
-  }
-
-  const seed = String(seedText || '');
-  const hash = [...seed].reduce((sum, char, index) => sum + char.charCodeAt(0) * (index + 1), 0);
-  return profiles[hash % profiles.length] || profiles[0];
-};
+const groqBase64LimitBytes = Number(process.env.GROQ_BASE64_LIMIT_BYTES || 4 * 1024 * 1024);
+const groqBase64SafetyBytes = Math.floor(groqBase64LimitBytes * 0.85);
+const groqImageMaxDimension = clampLimit(process.env.GROQ_IMAGE_MAX_DIM, 3072, 4096);
 
 const normalizeDetectedText = (value) => {
   const normalized = String(value || '').trim();
@@ -138,7 +92,7 @@ const normalizePlateNumber = (value) => {
     return null;
   }
 
-  return normalized.replace(/\s+/g, ' ').toUpperCase();
+  return normalized.replace(/[^a-zA-Z0-9]+/g, ' ').trim().replace(/\s+/g, ' ').toUpperCase();
 };
 
 const parseGroqJson = (content = '') => {
@@ -164,6 +118,43 @@ const parseGroqJson = (content = '') => {
   }
 };
 
+const buildGroqVisionDataUrl = async (imageBuffer) => {
+  const presets = [
+    { maxDim: groqImageMaxDimension, quality: 86 },
+    { maxDim: Math.min(groqImageMaxDimension, 2560), quality: 84 },
+    { maxDim: Math.min(groqImageMaxDimension, 2048), quality: 82 },
+    { maxDim: Math.min(groqImageMaxDimension, 1600), quality: 80 },
+    { maxDim: Math.min(groqImageMaxDimension, 1280), quality: 76 },
+    { maxDim: Math.min(groqImageMaxDimension, 1024), quality: 70 },
+  ].filter(
+    (preset, index, list) =>
+      preset.maxDim > 0 && list.findIndex((item) => item.maxDim === preset.maxDim) === index
+  );
+
+  const base = sharp(imageBuffer).rotate();
+
+  for (const preset of presets) {
+    const processed = await base
+      .clone()
+      .resize({
+        width: preset.maxDim,
+        height: preset.maxDim,
+        fit: 'inside',
+        withoutEnlargement: true,
+      })
+      .sharpen()
+      .jpeg({ quality: preset.quality, mozjpeg: true })
+      .toBuffer();
+
+    const dataUrl = `data:image/jpeg;base64,${processed.toString('base64')}`;
+    if (Buffer.byteLength(dataUrl, 'utf8') <= groqBase64SafetyBytes) {
+      return dataUrl;
+    }
+  }
+
+  return null;
+};
+
 const detectVehicleWithGroq = async ({ imageDataUrl }) => {
   if (!groqApiKey) {
     return null;
@@ -182,12 +173,15 @@ const detectVehicleWithGroq = async ({ imageDataUrl }) => {
       body: JSON.stringify({
         model: groqVisionModel,
         temperature: 0,
+        top_p: 1,
+        stream: false,
+        response_format: { type: 'json_object' },
         max_completion_tokens: 700,
         messages: [
           {
             role: 'system',
             content:
-              'You analyze vehicle photos for a women-safety app. Return only one valid JSON object. Be conservative. Never invent a plate number, driver, or hidden detail. If a field is not clearly visible, set it to null. Prioritize visible evidence for no-plate vehicles such as type, color, brand badge, model clues, and distinguishing marks.',
+              'You analyze vehicle photos for a women-safety app. Return only one valid JSON object. Be conservative. Never invent a plate number or hidden detail, and never return driver, owner, or phone details. If a field is not clearly visible, set it to null. Your first priority is OCR: read the visible vehicle registration or license plate exactly. If no usable plate is visible or readable, describe only visible vehicle clues.',
           },
           {
             role: 'user',
@@ -200,15 +194,16 @@ const detectVehicleWithGroq = async ({ imageDataUrl }) => {
                     'vehicleType, vehicleBrand, vehicleModel, vehicleColor, plateNumber, noPlateVisible, confidence, identificationMark.',
                     'Rules:',
                     '1. Return only one JSON object and no extra text.',
-                    '2. plateNumber must be null if the plate is missing, cropped, blurred, blocked, too small, or not confidently readable.',
-                    '3. Set noPlateVisible=true when no usable plate is visible or readable.',
-                    '4. identificationMark should describe only clearly visible clues such as stickers, bumper guard, helmet hook, roof rail, tarp rope, mirror sticker, scratches, dents, text decals, seat-cover color, or other unique visible marks.',
-                    '5. vehicleBrand and vehicleModel must be null if not clearly visible from badge/shape clues.',
-                    '6. confidence must be one of: high, medium, low.',
-                    '7. Use short values only.',
-                    '8. If the image mainly shows a no-plate vehicle, focus on accurate visible clues instead of guessing missing details.',
+                    '2. plateNumber should contain only the readable registration text, normalized with spaces between groups when obvious, for example MH 12 AB 1234.',
+                    '3. plateNumber must be null if the plate is missing, cut off, blurred, blocked, too small, glare-covered, or not confidently readable.',
+                    '4. Set noPlateVisible=false only when plateNumber is confidently readable. Otherwise set noPlateVisible=true.',
+                    '5. If the image is cropped tightly around a plate, focus on plateNumber and set unclear vehicle fields to null.',
+                    '6. identificationMark should describe only clearly visible clues such as stickers, bumper guard, helmet hook, roof rail, tarp rope, mirror sticker, scratches, dents, text decals, seat-cover color, or other unique visible marks.',
+                    '7. vehicleBrand and vehicleModel must be null if not clearly visible from badge/shape clues.',
+                    '8. confidence must be one of: high, medium, low.',
+                    '9. Use short values only.',
                     'Example output:',
-                    '{"vehicleType":"Motorcycle","vehicleBrand":"Honda","vehicleModel":null,"vehicleColor":"Black","plateNumber":null,"noPlateVisible":true,"confidence":"medium","identificationMark":"Red helmet hook on left side"}',
+                    '{"vehicleType":"Car","vehicleBrand":null,"vehicleModel":null,"vehicleColor":"White","plateNumber":"MH 12 AB 1234","noPlateVisible":false,"confidence":"high","identificationMark":null}',
                   ].join(' '),
               },
               {
@@ -329,47 +324,57 @@ router.post('/', verifyToken, async (req, res) => {
     });
   }
 
+  if (!groqApiKey) {
+    return res.status(503).json({
+      success: false,
+      error:
+        'GROQ_API_KEY is not configured on the backend. Add GROQ_API_KEY to backend/.env and restart the server.',
+    });
+  }
+
   try {
     const fileExtension = extensionFromMime(parsedImage.mimeType);
     const imageBuffer = Buffer.from(parsedImage.base64, 'base64');
     const imageFingerprint = crypto.createHash('sha256').update(imageBuffer).digest('hex');
     const fileName = `${Date.now()}-${Math.round(Math.random() * 1e9)}${fileExtension}`;
     const filePath = path.join(uploadsDir, fileName);
-    const autoProfile = getAutoVehicleProfile(imageFingerprint);
-    const groqDetection = await detectVehicleWithGroq({ imageDataUrl });
+
+    const groqVisionDataUrl = await buildGroqVisionDataUrl(imageBuffer);
+    if (!groqVisionDataUrl) {
+      return res.status(413).json({
+        success: false,
+        error:
+          'Vehicle image is too large to analyze. Crop the photo around the number plate and try again.',
+      });
+    }
+
+    const groqDetection = await detectVehicleWithGroq({ imageDataUrl: groqVisionDataUrl });
+    if (!groqDetection) {
+      return res.status(502).json({
+        success: false,
+        error: 'Groq vision analysis failed. Please try again with a clearer cropped image.',
+      });
+    }
+
+    const hasReadablePlate = Boolean(groqDetection.plateNumber);
     const resolvedNoPlate =
-      groqDetection?.plateNumber
-        ? false
-        : typeof groqDetection?.noPlateVisible === 'boolean'
-          ? groqDetection.noPlateVisible
-          : typeof noPlate === 'boolean'
-            ? noPlate
-            : true;
+      noPlate === true ? true : !hasReadablePlate;
     const trustedVehicleType =
-      String(vehicleType || '').trim() || groqDetection?.vehicleType || autoProfile.vehicle_type || null;
+      String(vehicleType || '').trim() || groqDetection?.vehicleType || null;
     const trustedVehicleColor =
-      String(vehicleColor || '').trim() || groqDetection?.vehicleColor || autoProfile.color || null;
+      String(vehicleColor || '').trim() || groqDetection?.vehicleColor || null;
     const trustedVehicleBrand =
       String(vehicleBrand || '').trim() || groqDetection?.vehicleBrand || null;
     const trustedVehicleModel =
       String(vehicleModel || '').trim() || groqDetection?.vehicleModel || null;
 
-    const autoDetails = {
-      profileId: resolvedNoPlate ? null : autoProfile.profile_id || null,
-      driverName: resolvedNoPlate ? null : autoProfile.driver_name || null,
-      plateNumber:
-        groqDetection?.plateNumber ||
-        (resolvedNoPlate ? 'No plate visible' : autoProfile.plate_number || null),
-      driverPhone: resolvedNoPlate ? null : autoProfile.driver_phone || null,
-      ownerName: resolvedNoPlate ? null : autoProfile.owner_name || null,
-      operatorName: resolvedNoPlate ? null : autoProfile.operator_name || null,
-      registrationZone: resolvedNoPlate ? null : autoProfile.registration_zone || null,
-      fuelType: resolvedNoPlate ? null : autoProfile.fuel_type || null,
-      seatingCapacity: resolvedNoPlate ? null : autoProfile.seating_capacity || null,
-      vehicleCondition: resolvedNoPlate ? null : autoProfile.vehicle_condition || null,
-      identificationMark:
-        groqDetection?.identificationMark ||
-        (!resolvedNoPlate ? autoProfile.identification_mark || null : null),
+    const vehicleDetails = {
+      plateNumber: groqDetection?.plateNumber || null,
+      vehicleType: trustedVehicleType,
+      vehicleColor: trustedVehicleColor,
+      vehicleBrand: trustedVehicleBrand,
+      vehicleModel: trustedVehicleModel,
+      identificationMark: groqDetection?.identificationMark || null,
       aiConfidence: groqDetection?.confidence || null,
     };
 
@@ -377,36 +382,20 @@ router.post('/', verifyToken, async (req, res) => {
 
     const payload = {
       noPlate: resolvedNoPlate,
-      profileId: autoDetails.profileId,
       imageFingerprint,
       vehicleType: trustedVehicleType,
       vehicleColor: trustedVehicleColor,
       vehicleBrand: trustedVehicleBrand,
       vehicleModel: trustedVehicleModel,
-      plateNumber: autoDetails.plateNumber,
-      driverName: autoDetails.driverName,
-      driverPhone: autoDetails.driverPhone,
-      ownerName: autoDetails.ownerName,
-      operatorName: autoDetails.operatorName,
-      registrationZone: autoDetails.registrationZone,
-      fuelType: autoDetails.fuelType,
-      seatingCapacity: autoDetails.seatingCapacity,
-      vehicleCondition: autoDetails.vehicleCondition,
-      identificationMark: autoDetails.identificationMark,
-      vehicleDetails: autoDetails,
-      detectionSource: groqDetection ? 'groq_vision' : 'local_profile_fallback',
+      plateNumber: vehicleDetails.plateNumber,
+      identificationMark: vehicleDetails.identificationMark,
+      vehicleDetails,
+      detectionSource: 'groq_vision',
       note: String(note || '').trim() || null,
       imagePath: `uploads/vehicle-observations/${fileName}`,
       imageMimeType: parsedImage.mimeType,
       latitude: sanitizeNumber(latitude),
       longitude: sanitizeNumber(longitude),
-      profileSource: resolvedNoPlate
-        ? groqDetection
-          ? 'groq_vision_no_plate'
-          : 'no_plate_manual_fallback'
-        : groqDetection
-          ? 'groq_vision_with_profile_fallback'
-          : 'json_auto_fill',
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };

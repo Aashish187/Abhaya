@@ -134,21 +134,40 @@ const formatEventNotification = (event, historyItem) => {
   };
 };
 
-const formatVehicleNotification = (item) => ({
-  id: `vehicle-${item.id}`,
-  source: 'vehicle',
-  type: 'vehicle_scan_saved',
-  title: 'Vehicle no plate scanned',
-  message: [
-    item.plateNumber || 'Plate not detected',
-    item.driverName || 'Driver not available',
-    item.driverPhone || 'Phone not available',
-  ].join(' | '),
-  createdAt: item.createdAt || item.updatedAt || new Date().toISOString(),
-  icon: 'car-sport-outline',
-  tint: '#7b57d1',
-  background: '#f3edff',
-});
+const unavailableVehicleValuePattern = /^(unknown\b.*|not available|plate not readable|plate not detected|-|n\/a)$/i;
+const isDisplayableVehicleValue = (value) => {
+  const text = String(value || '').trim();
+  return Boolean(text) && !unavailableVehicleValuePattern.test(text);
+};
+
+const getDisplayableVehicleValue = (value) =>
+  isDisplayableVehicleValue(value) ? String(value).trim() : '';
+
+const formatVehicleNotification = (item) => {
+  const details = item.vehicleDetails || {};
+  const vehicleSummary = [
+    getDisplayableVehicleValue(item.vehicleType || details.vehicleType),
+    getDisplayableVehicleValue(item.vehicleBrand || details.vehicleBrand),
+    getDisplayableVehicleValue(item.vehicleModel || details.vehicleModel),
+    getDisplayableVehicleValue(item.vehicleColor || details.vehicleColor),
+  ].filter(Boolean);
+
+  return {
+    id: `vehicle-${item.id}`,
+    source: 'vehicle',
+    type: 'vehicle_scan_saved',
+    title: 'Vehicle number plate scanned',
+    message: [
+      getDisplayableVehicleValue(item.plateNumber || details.plateNumber),
+      vehicleSummary.join(' | '),
+      getDisplayableVehicleValue(item.identificationMark || details.identificationMark),
+    ].filter(Boolean).join(' | ') || 'Vehicle scan saved',
+    createdAt: item.createdAt || item.updatedAt || new Date().toISOString(),
+    icon: 'car-sport-outline',
+    tint: '#7b57d1',
+    background: '#f3edff',
+  };
+};
 
 const notificationsAPI = {
   list: async () => {

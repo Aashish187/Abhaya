@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useState, useEffect } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -13,9 +13,12 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
+import * as Location from 'expo-location';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useAuth } from '../context/AuthContext';
 import notificationsAPI from '../services/notifications';
 import { getLatestIncidentReport } from '../services/reportStorage';
+import { calculateRiskPercentage, getSafetyRecommendations } from '../services/riskAssessment';
 
 const { width } = Dimensions.get('window');
 
@@ -24,7 +27,7 @@ const actionCards = [
     key: 'scan',
     icon: 'camera-outline',
     title: 'Vehicle Scan',
-    subtitle: 'Capture vehicle details quickly',
+    subtitle: 'Scan number plate quickly',
     tint: '#7b57d1',
     background: '#f3edff',
   },
@@ -32,7 +35,7 @@ const actionCards = [
     key: 'journey',
     icon: 'map-outline',
     title: 'Journey Track',
-    subtitle: 'Start and monitor a safe route',
+    subtitle: 'Enter destination and track walking safely',
     tint: '#0f9d7a',
     background: '#e9fbf4',
   },
@@ -51,22 +54,6 @@ const actionCards = [
     subtitle: 'Save incidents and evidence',
     tint: '#2563eb',
     background: '#ebf3ff',
-  },
-  {
-    key: 'walking',
-    icon: 'walk-outline',
-    title: 'Walking',
-    subtitle: 'Track a walk with safety logs',
-    tint: '#6e44cf',
-    background: '#f3edff',
-  },
-  {
-    key: 'walkedLogs',
-    icon: 'footsteps-outline',
-    title: 'Walked Logs',
-    subtitle: 'See completed walking records',
-    tint: '#0f9d7a',
-    background: '#e9fbf4',
   },
 ];
 
@@ -110,6 +97,12 @@ export default function HomeScreen({ navigation }) {
   const avatarLetter = displayName.trim().charAt(0).toUpperCase() || 'P';
   const [recentActivity, setRecentActivity] = useState([]);
   const [activityLoading, setActivityLoading] = useState(true);
+  const [riskData, setRiskData] = useState(null);
+  const [riskLoading, setRiskLoading] = useState(true);
+  const [currentLocation, setCurrentLocation] = useState(null);
+  const [journeyData, setJourneyData] = useState(null);
+  const [recommendations, setRecommendations] = useState([]);
+  const locationTrackerRef = React.useRef(null);
 
   const loadRecentActivity = useCallback(async () => {
     setActivityLoading(true);
@@ -124,10 +117,142 @@ export default function HomeScreen({ navigation }) {
     }
   }, []);
 
+  // Load journey data if active
+  const loadJourneyData = useCallback(async () => {
+    try {
+      const journeyJSON = await AsyncStorage.getItem('@abhaya_active_journey');
+      if (journeyJSON) {
+        const journey = JSON.parse(journeyJSON);
+        
+        // Journey is active if it has a route with points
+        const isActive = Array.isArray(journey.route) && journey.route.length > 0;
+        
+        // Prepare the journey data with proper structure for risk calculation
+        const journeyData = {
+          isActive,
+          plannedRoute: isActive ? journey.route : [],
+          destination: journey.selectedDestination || null,
+          historyId: journey.activeHistoryId || null,
+          eta: journey.eta,
+          distanceKm: journey.distanceKm,
+        };
+        
+        setJourneyData(journeyData);
+      } else {
+        setJourneyData(null);
+      }
+    } catch (error) {
+      console.log('Error loading journey:', error);
+      setJourneyData(null);
+    }
+  }, []);
+
+  // Start location tracking
+  const startLocationTracking = useCallback(async () => {
+    try {
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== 'granted') {
+        console.log('Location permission denied');
+        // Set default Kolhapur location for testing
+        setCurrentLocation({
+          latitude: 16.7050,
+          longitude: 74.2433,
+        });
+        return;
+      }
+
+      // Get initial location
+      const location = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.Balanced,
+      });
+
+      const newLocation = {
+        latitude: location.coords.latitude,
+        longitude: location.coords.longitude,
+      };
+
+      setCurrentLocation(newLocation);
+
+      // Watch location updates every 5 seconds for better updates
+      locationTrackerRef.current = 'location-tracker-home';
+      const subscription = await Location.watchPositionAsync(
+        {
+          accuracy: Location.Accuracy.Balanced,
+          timeInterval: 5000,
+          distanceInterval: 10,
+        },
+        (location) => {
+          const updatedLocation = {
+            latitude: location.coords.latitude,
+            longitude: location.coords.longitude,
+          };
+          setCurrentLocation(updatedLocation);
+        }
+      );
+
+      return subscription;
+    } catch (error) {
+      console.log('Location tracking error:', error);
+      // Fallback to Kolhapur center for testing
+      setCurrentLocation({
+        latitude: 16.7050,
+        longitude: 74.2433,
+      });
+    }
+  }, []);
+
+  // Calculate risk whenever location or journey changes
+  useEffect(() => {
+    if (currentLocation) {
+      const risk = calculateRiskPercentage(currentLocation, journeyData);
+      setRiskData(risk);
+      setRiskLoading(false);
+
+      // Generate recommendations
+      const recs = getSafetyRecommendations(risk);
+      setRecommendations(recs);
+    }
+  }, [currentLocation, journeyData]);
+
+  // Refresh risk every minute to account for time changes
+  useEffect(() => {
+    const interval = setInterval(() => {
+      if (currentLocation) {
+        const risk = calculateRiskPercentage(currentLocation, journeyData);
+        setRiskData(risk);
+
+        // Generate recommendations
+        const recs = getSafetyRecommendations(risk);
+        setRecommendations(recs);
+      }
+    }, 60000); // Refresh every 60 seconds
+
+    return () => clearInterval(interval);
+  }, [currentLocation, journeyData]);
+
+  // Setup location tracking on mount
+  useEffect(() => {
+    let subscription;
+
+    const setup = async () => {
+      subscription = await startLocationTracking();
+      await loadJourneyData();
+    };
+
+    setup();
+
+    return () => {
+      if (subscription && subscription.remove) {
+        subscription.remove();
+      }
+    };
+  }, [startLocationTracking, loadJourneyData]);
+
   useFocusEffect(
     useCallback(() => {
       loadRecentActivity();
-    }, [loadRecentActivity])
+      loadJourneyData();
+    }, [loadRecentActivity, loadJourneyData])
   );
 
   const handleSosPress = () => {
@@ -174,22 +299,12 @@ export default function HomeScreen({ navigation }) {
     }
 
     if (key === 'journey') {
-      navigation.navigate('Journey');
+      navigation.navigate('Journey', { mode: 'walking', linkedVehicleScan: null });
       return;
     }
 
     if (key === 'reports') {
       openReportsSection();
-      return;
-    }
-
-    if (key === 'walking') {
-      navigation.navigate('Journey', { mode: 'walking' });
-      return;
-    }
-
-    if (key === 'walkedLogs') {
-      navigation.navigate('JourneyHistory', { mode: 'walking' });
       return;
     }
 
@@ -212,7 +327,7 @@ export default function HomeScreen({ navigation }) {
     }
 
     if (key === 'Journey') {
-      navigation.navigate('Journey');
+      navigation.navigate('Journey', { mode: 'walking', linkedVehicleScan: null });
       return;
     }
 
@@ -279,39 +394,128 @@ export default function HomeScreen({ navigation }) {
         <View style={styles.safetyCard}>
           <View style={styles.safetyHeader}>
             <View style={styles.safeTitleWrap}>
-              <View style={styles.safeDot} />
-              <Text style={styles.safetyTitle}>You are Safe</Text>
+              <View
+                style={[
+                  styles.safeDot,
+                  {
+                    backgroundColor:
+                      riskData && riskData.percentage > 50 ? '#ef4444' : '#49d160',
+                  },
+                ]}
+              />
+              <Text style={styles.safetyTitle}>
+                {riskData ? (riskData.percentage > 50 ? 'Stay Alert' : 'You are Safe') : 'Assessing...'}
+              </Text>
             </View>
 
-            <View style={styles.darkChip}>
-              <Ionicons name="moon" size={12} color="#f8d664" />
-              <Text style={styles.darkChipText}>Dark</Text>
+            <View
+              style={[
+                styles.darkChip,
+                {
+                  backgroundColor:
+                    riskData && riskData.percentage > 50
+                      ? 'rgba(239, 68, 68, 0.2)'
+                      : 'rgba(255,255,255,0.14)',
+                },
+              ]}
+            >
+              <Ionicons
+                name={
+                  riskData && riskData.percentage > 50
+                    ? 'warning-outline'
+                    : 'moon'
+                }
+                size={12}
+                color={riskData && riskData.percentage > 50 ? '#fca5a5' : '#f8d664'}
+              />
+              <Text style={styles.darkChipText}>{riskData?.timeOfDay || 'Loading'}</Text>
             </View>
           </View>
 
           <View style={styles.safetyBody}>
-            <View style={styles.riskRing}>
-              <Text style={styles.riskValue}>15%</Text>
-              <Text style={styles.riskLabel}>Risk</Text>
+            <View
+              style={[
+                styles.riskRing,
+                {
+                  borderColor: riskData?.color || '#49d160',
+                  borderRightColor: riskData?.color
+                    ? `${riskData.color}40`
+                    : 'rgba(255,255,255,0.18)',
+                  borderBottomColor: riskData?.color
+                    ? `${riskData.color}40`
+                    : 'rgba(255,255,255,0.18)',
+                },
+              ]}
+            >
+              <Text style={styles.riskValue}>
+                {riskLoading ? '...' : `${riskData?.percentage || 0}%`}
+              </Text>
+              <Text style={styles.riskLabel}>{riskData?.level || 'Risk'}</Text>
             </View>
 
             <View style={styles.riskDetails}>
               <Text style={styles.riskHeading}>Risk Indicators</Text>
+
               <View style={styles.riskBulletRow}>
-                <View style={styles.riskBullet} />
-                <Text style={styles.riskBulletText}>Location: Safe</Text>
+                <View
+                  style={[
+                    styles.riskBullet,
+                    { backgroundColor: riskData?.locationRisk > 50 ? '#fca5a5' : '#49d160' },
+                  ]}
+                />
+                <Text style={styles.riskBulletText}>
+                  Location: {riskData?.locationRisk || 0}% risk
+                </Text>
               </View>
+
               <View style={styles.riskBulletRow}>
-                <View style={styles.riskBullet} />
-                <Text style={styles.riskBulletText}>Time: Day</Text>
+                <View style={[styles.riskBullet, { backgroundColor: riskData?.timeRisk > 50 ? '#fca5a5' : '#49d160' }]} />
+                <Text style={styles.riskBulletText}>
+                  Time: {riskData?.timeOfDay} ({riskData?.timeRisk || 0}% risk)
+                </Text>
               </View>
+
               <View style={styles.riskBulletRow}>
-                <View style={styles.riskBullet} />
-                <Text style={styles.riskBulletText}>Activity: Normal</Text>
+                <View
+                  style={[
+                    styles.riskBullet,
+                    {
+                      backgroundColor: riskData?.activityRisk > 50 ? '#fca5a5' : '#49d160',
+                    },
+                  ]}
+                />
+                <Text style={styles.riskBulletText}>
+                  Activity: {riskData?.activityRisk || 0}% risk
+                </Text>
               </View>
             </View>
           </View>
+
+          {/* Nearby Zones */}
+          {riskData?.nearbyZones && riskData.nearbyZones.length > 0 && (
+            <View style={styles.nearbyZonesContainer}>
+              <Text style={styles.nearbyZonesTitle}>⚠️ Nearby High-Risk Zones</Text>
+              {riskData.nearbyZones.map((zone, idx) => (
+                <View key={idx} style={styles.zoneItem}>
+                  <Text style={styles.zoneName}>{zone.name}</Text>
+                  <Text style={styles.zoneDistance}>{zone.distance}m away</Text>
+                </View>
+              ))}
+            </View>
+          )}
         </View>
+
+        {/* Safety Recommendations */}
+        {recommendations.length > 0 && (
+          <View style={styles.recommendationsCard}>
+            <Text style={styles.recommendationsTitle}>Safety Tips</Text>
+            {recommendations.slice(0, 2).map((rec, idx) => (
+              <Text key={idx} style={styles.recommendationText}>
+                {rec}
+              </Text>
+            ))}
+          </View>
+        )}
 
         <View style={styles.grid}>
           {actionCards.map((card) => (
@@ -649,6 +853,63 @@ const styles = StyleSheet.create({
     color: 'rgba(255,255,255,0.84)',
     fontSize: 13,
     fontWeight: '500',
+  },
+  nearbyZonesContainer: {
+    marginTop: 16,
+    paddingTop: 16,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255,255,255,0.2)',
+  },
+  nearbyZonesTitle: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '700',
+    marginBottom: 10,
+  },
+  zoneItem: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    backgroundColor: 'rgba(255,255,255,0.1)',
+    borderRadius: 8,
+  },
+  zoneName: {
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: '600',
+    flex: 1,
+  },
+  zoneDistance: {
+    color: 'rgba(255,255,255,0.7)',
+    fontSize: 11,
+    fontWeight: '500',
+  },
+  recommendationsCard: {
+    marginTop: 16,
+    backgroundColor: '#fff',
+    borderRadius: 18,
+    padding: 14,
+    shadowColor: '#14092c',
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.05,
+    shadowRadius: 12,
+    elevation: 2,
+  },
+  recommendationsTitle: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#1f1533',
+    marginBottom: 10,
+  },
+  recommendationText: {
+    fontSize: 12,
+    color: '#7f7b8d',
+    fontWeight: '500',
+    lineHeight: 18,
+    marginBottom: 8,
   },
   grid: {
     marginTop: 18,

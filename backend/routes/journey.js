@@ -7,8 +7,10 @@ const { haversine, minDistanceToRoute } = require('../utils/geo');
 const router = express.Router();
 
 const NOMINATIM_URL = 'https://nominatim.openstreetmap.org/search';
-const ORS_DIRECTIONS_URL =
-  'https://api.openrouteservice.org/v2/directions/driving-car';
+const ORS_DIRECTION_URLS = {
+  vehicle: 'https://api.openrouteservice.org/v2/directions/driving-car',
+  walking: 'https://api.openrouteservice.org/v2/directions/foot-walking',
+};
 const FIREBASE_TIMEOUT_MS = Number(process.env.FIREBASE_TIMEOUT_MS || 8000);
 const DEVIATION_THRESHOLD_METRES = Number(
   process.env.DEVIATION_THRESHOLD_METRES || 1000
@@ -122,7 +124,7 @@ const toLatLngObject = (point) => ({
   lng: Number(point[1].toFixed(6)),
 });
 
-const buildFallbackRoute = ({ originLat, originLng, destLat, destLng }) => {
+const buildFallbackRoute = ({ originLat, originLng, destLat, destLng, mode = 'vehicle' }) => {
   const totalDistanceMetres = haversine(originLat, originLng, destLat, destLng);
   const segmentCount = Math.max(12, Math.min(60, Math.ceil(totalDistanceMetres / 5000)));
   const route = [];
@@ -136,7 +138,7 @@ const buildFallbackRoute = ({ originLat, originLng, destLat, destLng }) => {
   }
 
   const distanceKm = Number((totalDistanceMetres / 1000).toFixed(2));
-  const assumedSpeedKmPerHour = 45;
+  const assumedSpeedKmPerHour = mode === 'walking' ? 4.5 : 45;
   const etaMinutes = Number(((distanceKm / assumedSpeedKmPerHour) * 60).toFixed(1));
 
   return {
@@ -151,6 +153,7 @@ const buildFallbackRoute = ({ originLat, originLng, destLat, destLng }) => {
     },
     fallback: true,
     provider: 'straight_line_fallback',
+    mode,
   };
 };
 
@@ -233,12 +236,15 @@ router.get('/route', async (req, res) => {
   const originLng = parseCoordinate(req.query.origin_lng);
   const destLat = parseCoordinate(req.query.dest_lat);
   const destLng = parseCoordinate(req.query.dest_lng);
+  const mode = String(req.query.mode || '').toLowerCase() === 'walking' ? 'walking' : 'vehicle';
+  const orsDirectionsUrl = ORS_DIRECTION_URLS[mode];
 
   logger.info('Journey route requested', {
     originLat,
     originLng,
     destLat,
     destLng,
+    mode,
   });
 
   if ([originLat, originLng, destLat, destLng].some((value) => value === null)) {
@@ -281,7 +287,7 @@ router.get('/route', async (req, res) => {
 
       for (const [attemptIndex, requestBody] of attemptBodies.entries()) {
         routeResponse = await timedJsonFetch(
-          ORS_DIRECTIONS_URL,
+          orsDirectionsUrl,
           {
             method: 'POST',
             headers,
@@ -322,6 +328,7 @@ router.get('/route', async (req, res) => {
             originLng,
             destLat,
             destLng,
+            mode,
           }),
         });
       }
@@ -363,6 +370,7 @@ router.get('/route', async (req, res) => {
           originLng,
           destLat,
           destLng,
+          mode,
         }),
       });
     }
@@ -386,6 +394,7 @@ router.get('/route', async (req, res) => {
         resolvedDestination: routes[0].route.length
           ? toLatLngObject(routes[0].route[routes[0].route.length - 1])
           : null,
+        mode,
       },
     });
   } catch (error) {
@@ -404,6 +413,7 @@ router.get('/route', async (req, res) => {
           originLng,
           destLat,
           destLng,
+          mode,
         }),
       });
     }
@@ -423,6 +433,7 @@ router.get('/route', async (req, res) => {
           originLng,
           destLat,
           destLng,
+          mode,
         }),
       });
     }
