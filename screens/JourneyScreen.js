@@ -18,14 +18,14 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { useFocusEffect } from '@react-navigation/native';
 import MapView, { Circle, Marker, Polyline } from 'react-native-maps';
+import { Camera } from 'expo-camera';
 import * as Location from 'expo-location';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useAuth } from '../context/AuthContext';
-import { useReport } from '../context/ReportContext';
-import { saveIncidentReport } from '../services/reportStorage';
 
 import journeyAPI from '../services/journey';
 import vehicleObservationAPI from '../services/vehicleObservations';
+import AudioAnalysisService from '../services/AudioAnalysisService';
 import {
   SECURITY_PASSWORD_DESCRIPTION,
   verifySecurityPassword,
@@ -198,6 +198,72 @@ const SAFE_DEVIATION_REASON_OPTIONS = [
   'Road blocked',
   'Stopping briefly',
 ];
+const SAFE_STATIONARY_REASON_OPTIONS = [
+  'Waiting for pickup',
+  'Taking a short break',
+  'Traffic stopped',
+  'Phone network issue',
+];
+
+const getSafeReasonModalContent = (promptType) => {
+  if (promptType === 'stationary') {
+    return {
+      title: 'Reason for safety check',
+      body: 'Tell us why you have paused or stayed in the same place so we can stop escalation safely.',
+      placeholder: 'Why are you safe right now?',
+      options: SAFE_STATIONARY_REASON_OPTIONS,
+    };
+  }
+
+  return {
+    title: 'Reason for deviation',
+    body: 'Tell us why you moved away from the route. Example: changing shortcut or avoiding traffic.',
+    placeholder: 'Reason for deviation',
+    options: SAFE_DEVIATION_REASON_OPTIONS,
+  };
+};
+
+const formatAudioMeterValue = (value) =>
+  Number.isFinite(value) ? `${value.toFixed(1)} dB` : '--';
+
+const resolveSosTriggerType = (reason) => {
+  const normalizedReason = String(reason || '').toLowerCase();
+
+  if (normalizedReason.includes('scream') || normalizedReason.includes('panic keyword')) {
+    return 'Audio Panic SOS';
+  }
+
+  if (normalizedReason.includes('stationary')) {
+    return 'Stationary Alert SOS';
+  }
+
+  return 'Journey SOS';
+};
+
+const getUserDisplayName = (user) =>
+  String(user?.displayName || user?.name || 'Abhaya User').trim() || 'Abhaya User';
+
+const getUserPhone = (user) =>
+  String(user?.phone || user?.phoneNumber || user?.mobile || user?.contact || '').trim();
+
+const buildRuntimeVehicleDetails = (vehicle) => {
+  if (!vehicle) {
+    return null;
+  }
+
+  const vehicleDetails = {
+    vehicleScanId: vehicle?.id || null,
+    plateNumber: getVehicleFieldValue(vehicle, 'plateNumber') || null,
+    vehicleType: getVehicleFieldValue(vehicle, 'vehicleType') || null,
+    vehicleBrand: getVehicleFieldValue(vehicle, 'vehicleBrand') || null,
+    vehicleModel: getVehicleFieldValue(vehicle, 'vehicleModel') || null,
+    vehicleColor: getVehicleFieldValue(vehicle, 'vehicleColor') || null,
+    identificationMark: getVehicleFieldValue(vehicle, 'identificationMark') || null,
+  };
+
+  const hasVehicleData = Object.values(vehicleDetails).some(Boolean);
+  return hasVehicleData ? vehicleDetails : null;
+};
 
 const classifySafeDeviationReason = (reason) => {
   const normalized = String(reason || '').trim().toLowerCase();
@@ -266,7 +332,6 @@ const classifySafeDeviationReason = (reason) => {
 
 export default function JourneyScreen({ navigation, route: screenRoute }) {
   const { user } = useAuth();
-  const { setLatestReport } = useReport();
   const routedVehicleScan = screenRoute?.params?.linkedVehicleScan || null;
   const requestedMode = screenRoute?.params?.mode || null;
   const mapRef = useRef(null);
@@ -286,6 +351,8 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
   const safetyPromptRef = useRef(null);
   const activeHistoryIdRef = useRef(null);
   const isSosFinalizedRef = useRef(false);
+  const isSosInFlightRef = useRef(false);
+  const hasTriggeredSosRef = useRef(false);
   const lastAnnouncedZoneRef = useRef({ id: null, at: 0 });
   const lastSafeDeviationRef = useRef({
     classification: null,
@@ -293,6 +360,7 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
     suppressUntil: 0,
     baselineDistance: null,
   });
+  const activeAudioPromptTypeRef = useRef(null);
 
   const [permissionStatus, setPermissionStatus] = useState('pending');
   const [locationError, setLocationError] = useState('');
@@ -340,6 +408,17 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
   const [activeCrimeZone, setActiveCrimeZone] = useState(null);
   const [nearbyCrimeZones, setNearbyCrimeZones] = useState([]);
   const [mapRegion, setMapRegion] = useState(DEFAULT_REGION);
+  const [audioDebugState, setAudioDebugState] = useState({
+    isAnalyzing: false,
+    latestMetering: null,
+    averageMetering: null,
+    lastTranscript: '',
+    matchedKeywords: [],
+    lastEvent: 'idle',
+    lastPanicReason: '',
+    updatedAt: null,
+  });
+  const [audioSimulationInput, setAudioSimulationInput] = useState('');
   const lastWalkingLogAtRef = useRef(0);
   const isVehicleScanMode = requestedMode === 'vehicle';
   const linkedVehicleScan = isVehicleScanMode ? routedVehicleScan || latestVehicleScan : null;
@@ -421,6 +500,13 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
       })),
     [alternatives]
   );
+  const safeReasonModalContent = useMemo(
+    () => getSafeReasonModalContent(safeReasonPrompt?.type),
+    [safeReasonPrompt?.type]
+  );
+  const isDeviationAudioUiVisible =
+    __DEV__ &&
+    (safetyPrompt?.type === 'deviation' || safeReasonPrompt?.type === 'deviation');
 
   useEffect(() => {
     latestPositionRef.current = currentPosition;
@@ -441,6 +527,17 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
   useEffect(() => {
     isTestLocationActiveRef.current = isTestLocationActive;
   }, [isTestLocationActive]);
+
+  useEffect(() => {
+    const unsubscribeDebug = AudioAnalysisService.addDebugListener((nextState) => {
+      setAudioDebugState(nextState);
+    });
+
+    return () => {
+      unsubscribeDebug();
+      AudioAnalysisService.stopAnalysis().catch(() => {});
+    };
+  }, []);
 
   useEffect(() => {
     if (!currentPosition) {
@@ -495,6 +592,22 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
     setNearbyCrimeZones(nearbyZones);
     setActiveCrimeZone(nearbyZones[0] || null);
   }, [currentPosition]);
+
+  const stopEmergencyAudioMonitoring = useCallback(async () => {
+    activeAudioPromptTypeRef.current = null;
+    await AudioAnalysisService.stopAnalysis().catch(() => {});
+  }, []);
+
+  const prewarmEmergencyEvidencePermissions = useCallback(async () => {
+    try {
+      await Promise.allSettled([
+        Camera.requestCameraPermissionsAsync(),
+        Camera.requestMicrophonePermissionsAsync(),
+      ]);
+    } catch {
+      // Permission pre-warm is best-effort and should never block the journey flow.
+    }
+  }, []);
 
   const resetDeviationState = useCallback(() => {
     setDeviationDistance(null);
@@ -564,6 +677,8 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
     setDistanceKm(null);
     setIsTracking(false);
     setIsSosFinalized(false);
+    isSosInFlightRef.current = false;
+    hasTriggeredSosRef.current = false;
     setVehicleObservations([]);
     setVehicleTypeInput('');
     setVehicleColorInput('');
@@ -572,9 +687,18 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
     setVehicleNoteInput('');
     stationaryAnchorRef.current = null;
     lastWalkingLogAtRef.current = 0;
+    activeAudioPromptTypeRef.current = null;
     resetDeviationState();
+    await stopEmergencyAudioMonitoring();
     await clearSavedJourney();
-  }, [clearSavedJourney, isWalkingMode, resetDeviationState, stopDeviationChecks, stopStationaryChecks]);
+  }, [
+    clearSavedJourney,
+    isWalkingMode,
+    resetDeviationState,
+    stopDeviationChecks,
+    stopEmergencyAudioMonitoring,
+    stopStationaryChecks,
+  ]);
 
   const completeJourney = useCallback(async () => {
     const historyId = activeHistoryIdRef.current;
@@ -750,11 +874,12 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
   useEffect(() => () => {
     stopDeviationChecks();
     stopStationaryChecks();
+    stopEmergencyAudioMonitoring().catch(() => {});
     if (watchSubscriptionRef.current) {
       watchSubscriptionRef.current.remove();
       watchSubscriptionRef.current = null;
     }
-  }, [stopDeviationChecks, stopStationaryChecks]);
+  }, [stopDeviationChecks, stopEmergencyAudioMonitoring, stopStationaryChecks]);
 
   const loadLatestVehicleScan = useCallback(async () => {
     setIsLoadingLatestVehicleScan(true);
@@ -895,105 +1020,151 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
     });
   }, []);
 
-  const buildJourneyIncidentReport = useCallback(
-    async (reason) => {
-      const position = latestPositionRef.current;
-      const linkedVehicle = vehicleHistorySummary
-        ? linkedVehicleScan
-        : vehicleObservations[vehicleObservations.length - 1] || null;
-      const triggerType =
-        String(reason || '').includes('stationary') ? 'Stationary Alert SOS' : 'Journey SOS';
-      let resolvedAddress = '';
+  const buildRuntimeIncidentReportSeed = useCallback(
+    (reason, position) => {
+      const triggerType = resolveSosTriggerType(reason);
+      const runtimeVehicle = buildRuntimeVehicleDetails(linkedVehicleScan);
+      const location =
+        position && Number.isFinite(position.latitude) && Number.isFinite(position.longitude)
+          ? {
+              lat: position.latitude,
+              lng: position.longitude,
+              address: '',
+              source: 'journey_tracking',
+              capturedAt: new Date().toISOString(),
+            }
+          : {
+              lat: null,
+              lng: null,
+              address: '',
+              source: 'journey_tracking',
+              capturedAt: new Date().toISOString(),
+            };
 
-      if (position?.latitude !== undefined && position?.longitude !== undefined) {
-        try {
-          const results = await Location.reverseGeocodeAsync({
-            latitude: position.latitude,
-            longitude: position.longitude,
-          });
-          resolvedAddress = formatResolvedAddress(Array.isArray(results) ? results[0] : null);
-        } catch {
-          resolvedAddress = '';
-        }
-      }
+      const timeline = [
+        'SOS triggered from active journey monitoring',
+        reason ? `Trigger reason: ${reason}` : '',
+        selectedDestination?.displayName ? `Destination selected: ${selectedDestination.displayName}` : '',
+        Number.isFinite(distanceKm) ? `Planned distance: ${distanceKm} km` : '',
+        Number.isFinite(eta) ? `Estimated arrival: ${eta} min` : '',
+        runtimeVehicle?.plateNumber ? `Scanned vehicle linked: ${runtimeVehicle.plateNumber}` : '',
+        activeCrimeZone?.name
+          ? `Nearby risk zone at trigger time: ${activeCrimeZone.name} (${getCrimeZoneStyle(activeCrimeZone.risk).label})`
+          : '',
+      ].filter(Boolean);
 
       return {
-        incidentId: `journey_inc_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
         createdAt: new Date().toISOString(),
         status: 'ACTIVE',
         user: {
-          name: user?.displayName || user?.name || 'Abhaya User',
-          phone:
-            user?.phone || user?.phoneNumber || user?.mobile || user?.contact || '',
-          email: user?.email || '',
+          uid: user?.uid || user?.id || null,
+          name: getUserDisplayName(user),
+          phone: getUserPhone(user) || null,
+          email: user?.email || null,
         },
+        location,
         trigger: {
           type: triggerType,
-          riskScore: activeCrimeZone?.risk === 'high' ? 'HIGH' : 'MEDIUM',
-          reason,
+          riskScore: 'HIGH',
+          reason: reason || null,
         },
-        location: {
-          lat: position?.latitude ?? null,
-          lng: position?.longitude ?? null,
-          address:
-            resolvedAddress ||
-            activeCrimeZone?.name ||
-            'Journey location captured from live tracking',
+        vehicle: runtimeVehicle,
+        journey: {
+          mode: journeyMode,
+          historyId: activeHistoryIdRef.current || null,
+          selectedRouteIndex:
+            Number.isInteger(selectedRouteIndex) && selectedRouteIndex >= 0
+              ? selectedRouteIndex
+              : null,
+          distanceKm: Number.isFinite(distanceKm) ? distanceKm : null,
+          etaMinutes: Number.isFinite(eta) ? eta : null,
+          destinationName: selectedDestination?.displayName || null,
+          destinationLat: selectedDestination?.lat ?? null,
+          destinationLng: selectedDestination?.lng ?? null,
+          monitoringStatus: 'paused_for_sos',
+          source: 'journey_runtime',
         },
-        vehicle: linkedVehicle
+        zone: activeCrimeZone
           ? {
-              plateNumber: getVehicleFieldValue(linkedVehicle, 'plateNumber'),
-              vehicleType: getVehicleFieldValue(linkedVehicle, 'vehicleType'),
-              vehicleBrand: getVehicleFieldValue(linkedVehicle, 'vehicleBrand'),
-              vehicleModel: getVehicleFieldValue(linkedVehicle, 'vehicleModel'),
-              vehicleColor: getVehicleFieldValue(linkedVehicle, 'vehicleColor'),
-              identificationMark: getVehicleFieldValue(linkedVehicle, 'identificationMark'),
+              id: activeCrimeZone.id || null,
+              name: activeCrimeZone.name || null,
+              risk: activeCrimeZone.risk || null,
+              description: activeCrimeZone.description || null,
+              distance:
+                Number.isFinite(activeCrimeZone.distance) ? activeCrimeZone.distance : null,
             }
           : null,
         evidence: [],
-        timeline: [
-          'Journey monitoring active',
-          `Safety prompt triggered: ${triggerType}`,
-          `SOS sent from journey screen: ${reason}`,
-          selectedDestination?.displayName
-            ? `Destination selected: ${selectedDestination.displayName}`
-            : '',
-        ].filter(Boolean),
+        timeline,
         notification: {
-          sent: true,
+          sent: false,
         },
       };
     },
     [
-      activeCrimeZone?.name,
-      activeCrimeZone?.risk,
+      activeCrimeZone,
+      distanceKm,
+      eta,
+      journeyMode,
       linkedVehicleScan,
       selectedDestination?.displayName,
-      setLatestReport,
-      user?.contact,
-      user?.displayName,
-      user?.email,
-      user?.mobile,
-      user?.name,
-      user?.phone,
-      user?.phoneNumber,
-      vehicleObservations,
-      vehicleHistorySummary,
+      selectedDestination?.lat,
+      selectedDestination?.lng,
+      selectedRouteIndex,
+      user,
     ]
   );
 
   const triggerSOS = useCallback(
     async (reason, options = {}) => {
-      const position = latestPositionRef.current;
+      if (hasTriggeredSosRef.current || isSosFinalizedRef.current || isSosInFlightRef.current) {
+        return;
+      }
+
+      let position = latestPositionRef.current;
+
+      if (!position) {
+        try {
+          const lastKnownPosition = await Location.getLastKnownPositionAsync();
+          if (lastKnownPosition?.coords) {
+            position = {
+              latitude: lastKnownPosition.coords.latitude,
+              longitude: lastKnownPosition.coords.longitude,
+            };
+          }
+        } catch {}
+      }
+
+      if (!position) {
+        try {
+          const freshPosition = await Location.getCurrentPositionAsync({
+            accuracy: Location.Accuracy.Balanced,
+          });
+
+          if (freshPosition?.coords) {
+            position = {
+              latitude: freshPosition.coords.latitude,
+              longitude: freshPosition.coords.longitude,
+            };
+          }
+        } catch {}
+      }
 
       if (!position) {
         Alert.alert('Location Unavailable', 'Wait for GPS before sending SOS.');
         return;
       }
 
+      latestPositionRef.current = position;
+      setCurrentPosition(position);
+
+      isSosInFlightRef.current = true;
+
       try {
         if (options.finalizeJourney !== false) {
+          stopEmergencyAudioMonitoring().catch(() => {});
           stopTracking();
+          clearSavedJourney().catch(() => {});
           setIsSosFinalized(true);
           stationaryAlertOpenRef.current = false;
           safetyPromptRef.current = null;
@@ -1008,54 +1179,127 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
           });
         }
 
-        await journeyAPI.triggerSOS({
-          userLat: position.latitude,
-          userLng: position.longitude,
-          reason,
-        });
-
-        if (activeHistoryIdRef.current) {
-          await journeyAPI.addHistoryEvent({
-            historyId: activeHistoryIdRef.current,
-            type: 'sos_sent',
-            message: `SOS sent: ${reason}`,
-            location: {
-              lat: position.latitude,
-              lng: position.longitude,
-            },
-          }).catch(() => {});
-
-          if (options.finalizeJourney !== false) {
-            await journeyAPI.updateHistory({
-              historyId: activeHistoryIdRef.current,
-              status: 'ended',
-              message: 'Journey monitoring paused after SOS was triggered',
-            }).catch(() => {});
-          }
-        }
-
-        if (options.showAlert !== false) {
-          Alert.alert(
-            'SOS Sent',
-            'Emergency alert has been recorded with your live location.'
-          );
-        }
+        const reportSeed =
+          options.prepareReport !== false
+            ? buildRuntimeIncidentReportSeed(reason, position)
+            : null;
 
         if (options.prepareReport !== false) {
-          const report = await buildJourneyIncidentReport(reason);
-          await saveIncidentReport(report);
-          await setLatestReport(report);
-
-          navigation.navigate('ReportDetails', {
-            incidentId: report.incidentId,
-            report,
+          navigation.navigate('IncidentReport', {
+            autoStartEvidence: true,
+            triggerType: resolveSosTriggerType(reason),
+            triggerReason: reason,
+            source: 'journey_sos',
+            reportSeed,
           });
         }
+
+        (async () => {
+          try {
+            await journeyAPI.triggerSOS({
+              userLat: position.latitude,
+              userLng: position.longitude,
+              reason,
+            });
+            hasTriggeredSosRef.current = true;
+
+            if (activeHistoryIdRef.current) {
+              await journeyAPI.addHistoryEvent({
+                historyId: activeHistoryIdRef.current,
+                type: 'sos_sent',
+                message: `SOS sent: ${reason}`,
+                location: {
+                  lat: position.latitude,
+                  lng: position.longitude,
+                },
+              }).catch(() => {});
+
+              if (options.finalizeJourney !== false) {
+                await journeyAPI.updateHistory({
+                  historyId: activeHistoryIdRef.current,
+                  status: 'ended',
+                  message: 'Journey monitoring paused after SOS was triggered',
+                }).catch(() => {});
+              }
+            }
+
+            if (options.showAlert !== false) {
+              Alert.alert(
+                'SOS Sent',
+                'Emergency alert has been recorded with your live location.'
+              );
+            }
+          } catch (error) {
+            if (options.showAlert !== false) {
+              Alert.alert(
+                'SOS Sync Delayed',
+                error?.message || 'Emergency sync is taking longer than expected, but evidence recording has started.'
+              );
+            }
+          } finally {
+            isSosInFlightRef.current = false;
+          }
+        })();
       } catch (error) {
+        isSosInFlightRef.current = false;
+        if (!hasTriggeredSosRef.current) {
+          setIsSosFinalized(false);
+        }
         Alert.alert('SOS Failed', error.message || 'Could not send SOS right now.');
       }
     },
-    [buildJourneyIncidentReport, navigation, setLatestReport, stopTracking]
+    [
+      buildRuntimeIncidentReportSeed,
+      clearSavedJourney,
+      navigation,
+      stopEmergencyAudioMonitoring,
+      stopTracking,
+    ]
+  );
+
+  const startEmergencyAudioMonitoring = useCallback(
+    async (promptType) => {
+      activeAudioPromptTypeRef.current = promptType || 'deviation';
+      prewarmEmergencyEvidencePermissions().catch(() => {});
+
+      const started = await AudioAnalysisService.startAnalysis((panicReason) => {
+        const historyId = activeHistoryIdRef.current;
+        const position = latestPositionRef.current;
+
+        if (historyId) {
+          journeyAPI.addHistoryEvent({
+            historyId,
+            type: 'audio_panic_detected',
+            message: panicReason,
+            location: position
+              ? {
+                  lat: position.latitude,
+                  lng: position.longitude,
+                }
+              : null,
+            metadata: {
+              promptType: activeAudioPromptTypeRef.current || null,
+            },
+          }).catch(() => {});
+        }
+
+        triggerSOS(panicReason, {
+          showAlert: false,
+          prepareReport: true,
+          finalizeJourney: true,
+        });
+      });
+
+      if (!started) {
+        setSafetyNotification({
+          title: 'Audio monitoring unavailable',
+          message:
+            'Microphone access is off or audio capture could not start. Journey prompts and SOS still work normally.',
+          tone: 'info',
+        });
+      }
+    },
+    [prewarmEmergencyEvidencePermissions, triggerSOS]
   );
 
   const showSafetyPrompt = useCallback(
@@ -1067,6 +1311,7 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
       stationaryAlertOpenRef.current = true;
       safetyPromptRef.current = prompt;
       setSafetyPrompt(prompt);
+      startEmergencyAudioMonitoring(prompt?.type).catch(() => {});
 
       addJourneyLog({
         type: prompt?.type === 'stationary' ? 'stationary_safety_prompt' : 'deviation_safety_prompt',
@@ -1081,7 +1326,7 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
         },
       });
     },
-    [addJourneyLog]
+    [addJourneyLog, startEmergencyAudioMonitoring]
   );
 
   const dismissSafetyPrompt = useCallback(() => {
@@ -1209,6 +1454,10 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
     const nextIsTracking = !isTracking;
     setIsTracking(nextIsTracking);
 
+    if (!nextIsTracking) {
+      await stopEmergencyAudioMonitoring();
+    }
+
     await addJourneyLog({
       type: nextIsTracking ? 'journey_resumed' : 'journey_paused',
       message: nextIsTracking
@@ -1218,14 +1467,24 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
         selectedDestination: selectedDestination?.displayName || null,
       },
     });
-  }, [addJourneyLog, isSosFinalized, isTracking, route.length, selectedDestination?.displayName]);
+  }, [
+    addJourneyLog,
+    isSosFinalized,
+    isTracking,
+    route.length,
+    selectedDestination?.displayName,
+    stopEmergencyAudioMonitoring,
+  ]);
 
   const submitSafeReason = useCallback(async () => {
     const reason = safeReasonText.trim();
     const password = safeReasonPassword.trim();
+    const promptType = safeReasonPrompt?.type || 'deviation';
+    const deviationClassification =
+      promptType === 'deviation' ? classifySafeDeviationReason(reason) : null;
 
     if (!password) {
-      Alert.alert('Safety Password Required', 'Enter your safety password before submitting the deviation reason.');
+      Alert.alert('Safety Password Required', 'Enter your safety password before submitting your safety reason.');
       return;
     }
 
@@ -1238,34 +1497,47 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
       return;
     }
 
-    const classification = classifySafeDeviationReason(reason);
-    const suppressionEndsAt = Date.now() + SAFE_REASON_SUPPRESSION_MS;
+    if (promptType === 'deviation') {
+      const suppressionEndsAt = Date.now() + SAFE_REASON_SUPPRESSION_MS;
 
-    lastSafeDeviationRef.current = {
-      classification: classification.code,
-      reason,
-      suppressUntil: suppressionEndsAt,
-      baselineDistance: deviationDistance,
-    };
+      lastSafeDeviationRef.current = {
+        classification: deviationClassification.code,
+        reason,
+        suppressUntil: suppressionEndsAt,
+        baselineDistance: deviationDistance,
+      };
 
-    setSafetyNotification({
-      title: 'Deviation noted',
-      message: `${classification.notification} We will ask again only if this continues after some time or becomes much larger.`,
-      tone: classification.code === 'safe_shortcut' ? 'info' : 'success',
-    });
+      setSafetyNotification({
+        title: 'Deviation noted',
+        message: `${deviationClassification.notification} We will ask again only if this continues after some time or becomes much larger.`,
+        tone: deviationClassification.code === 'safe_shortcut' ? 'info' : 'success',
+      });
 
-    AccessibilityInfo.announceForAccessibility(classification.notification);
+      AccessibilityInfo.announceForAccessibility(deviationClassification.notification);
+    } else {
+      setSafetyNotification({
+        title: 'Safety confirmed',
+        message: 'Your reason and safety password were verified. Audio escalation has been stopped.',
+        tone: 'success',
+      });
+
+      AccessibilityInfo.announceForAccessibility('Safety confirmed. Audio escalation has been stopped.');
+    }
 
     await addJourneyLog({
-      type: 'safe_deviation_reason',
-      message: `Deviation marked safe: ${reason || 'No reason provided'}`,
+      type: promptType === 'stationary' ? 'safe_stationary_reason' : 'safe_deviation_reason',
+      message: `${
+        promptType === 'stationary' ? 'Stationary alert' : 'Deviation'
+      } marked safe: ${reason || 'No reason provided'}`,
       metadata: {
-        classification: classification.code,
+        classification:
+          promptType === 'deviation' ? deviationClassification.code : 'safe_stationary_reason',
         reason: reason || null,
-        promptType: safeReasonPrompt?.type || 'deviation',
+        promptType,
       },
     });
 
+    await stopEmergencyAudioMonitoring();
     setSafeReasonPrompt(null);
     setSafeReasonText('');
     setSafeReasonPassword('');
@@ -1277,34 +1549,17 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
     safeReasonPassword,
     safeReasonPrompt?.type,
     safeReasonText,
+    stopEmergencyAudioMonitoring,
     user?.email,
   ]);
 
   const handleSafePress = useCallback(() => {
     const activePrompt = safetyPromptRef.current || safetyPrompt;
-
-    if (activePrompt?.type === 'deviation') {
-      setSafeReasonPrompt(activePrompt);
-      setSafetyPrompt(null);
-      setSafeReasonText('');
-      setSafeReasonPassword('');
-      return;
-    }
-
-    setSafetyNotification({
-      title: 'Safety confirmed',
-      message: 'You marked yourself safe. Monitoring will continue in the background.',
-      tone: 'success',
-    });
-    addJourneyLog({
-      type: 'safety_confirmed',
-      message: 'User marked themselves safe after a safety alert.',
-      metadata: {
-        promptType: activePrompt?.type || 'unknown',
-      },
-    });
-    dismissSafetyPrompt();
-  }, [addJourneyLog, dismissSafetyPrompt, safetyPrompt]);
+    setSafeReasonPrompt(activePrompt);
+    setSafetyPrompt(null);
+    setSafeReasonText('');
+    setSafeReasonPassword('');
+  }, [safetyPrompt]);
 
   useEffect(() => {
     if (!activeCrimeZone) {
@@ -1365,6 +1620,7 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
     setDistanceKm(null);
     setSelectedDestination(null);
     setJourneyStart(null);
+    await stopEmergencyAudioMonitoring();
     stopTracking();
     await clearSavedJourney();
 
@@ -1383,7 +1639,7 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
     } finally {
       setIsSearching(false);
     }
-  }, [clearSavedJourney, destinationQuery, stopTracking]);
+  }, [clearSavedJourney, destinationQuery, stopEmergencyAudioMonitoring, stopTracking]);
 
   const checkRouteDeviation = useCallback(
     async ({ immediatePrompt = false } = {}) => {
@@ -1454,6 +1710,20 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
             baselineDistance: null,
           };
           setConsecutiveDeviationCount(0);
+
+          if (activeAudioPromptTypeRef.current === 'deviation') {
+            activeAudioPromptTypeRef.current = null;
+            stopEmergencyAudioMonitoring().catch(() => {});
+          }
+
+          if (safetyPromptRef.current?.type === 'deviation') {
+            stationaryAlertOpenRef.current = false;
+            safetyPromptRef.current = null;
+            setSafetyPrompt(null);
+            setSafeReasonPrompt(null);
+            setSafeReasonText('');
+            setSafeReasonPassword('');
+          }
         }
       } catch (error) {
         setJourneyError(error.message || 'Deviation check failed.');
@@ -1462,7 +1732,7 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
         setIsCheckingDeviation(false);
       }
     },
-    [addJourneyLog, showSafetyPrompt]
+    [addJourneyLog, showSafetyPrompt, stopEmergencyAudioMonitoring]
   );
 
   const startDeviationChecks = useCallback(() => {
@@ -1488,12 +1758,35 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
       return;
     }
 
-    const remainingDistance = haversineMetres(
-      currentPosition.latitude,
-      currentPosition.longitude,
-      selectedDestination.lat,
-      selectedDestination.lng
-    );
+    const arrivalTargets = [
+      selectedDestination &&
+      Number.isFinite(selectedDestination.lat) &&
+      Number.isFinite(selectedDestination.lng)
+        ? {
+            latitude: selectedDestination.lat,
+            longitude: selectedDestination.lng,
+          }
+        : null,
+      Array.isArray(route) && route.length
+        ? {
+            latitude: route[route.length - 1][0],
+            longitude: route[route.length - 1][1],
+          }
+        : null,
+    ].filter(Boolean);
+
+    const remainingDistance = arrivalTargets.length
+      ? Math.min(
+          ...arrivalTargets.map((target) =>
+            haversineMetres(
+              currentPosition.latitude,
+              currentPosition.longitude,
+              target.latitude,
+              target.longitude
+            )
+          )
+        )
+      : Infinity;
 
     if (remainingDistance <= ARRIVAL_THRESHOLD_METRES) {
       completeJourney();
@@ -1504,7 +1797,7 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
           : 'You have reached your destination safely. Tracking has been stopped.'
       );
     }
-  }, [completeJourney, currentPosition, isTracking, isWalkingMode, selectedDestination]);
+  }, [completeJourney, currentPosition, isTracking, isWalkingMode, route, selectedDestination]);
 
   const saveWalkingCheckpoint = useCallback(async () => {
     const position = latestPositionRef.current;
@@ -1667,8 +1960,8 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
   );
 
   const applyRouteSelection = useCallback(
-    async (routeData, destination, selectedIndex = 0) => {
-      const otherRoutes = routeOptions.filter((_, index) => index !== selectedIndex);
+    async (routeData, destination, selectedIndex = 0, availableOptions = routeOptions) => {
+      const otherRoutes = availableOptions.filter((_, index) => index !== selectedIndex);
       const startPoint = journeyStart || routeData.route[0] || null;
 
       setRoute(routeData.route);
@@ -1764,7 +2057,7 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
     async (destination) => {
       let position = latestPositionRef.current;
 
-      if (!isTestLocationActiveRef.current) {
+      if (!position && !isTestLocationActiveRef.current) {
         try {
           position = await refreshLiveLocation();
         } catch {
@@ -1821,15 +2114,16 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
           try {
             routeData = await journeyAPI.fetchRoute({
               originLat: position.latitude,
-              originLng: position.longitude,
-              destLat: candidate.lat,
-              destLng: candidate.lng,
-              mode: journeyMode,
-            });
-            resolvedDestination = candidate;
-            break;
-          } catch (error) {
-            lastRouteError = error;
+            originLng: position.longitude,
+            destLat: candidate.lat,
+            destLng: candidate.lng,
+            mode: journeyMode,
+            includeAlternatives: false,
+          });
+          resolvedDestination = candidate;
+          break;
+        } catch (error) {
+          lastRouteError = error;
           }
         }
 
@@ -1855,10 +2149,6 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
             distance_km: routeData.distance_km,
             label: 'Recommended route',
           },
-          ...(routeData.alternatives || []).map((alternative, index) => ({
-            ...alternative,
-            label: `Alternative route ${index + 2}`,
-          })),
         ];
 
         setRoute([]);
@@ -1873,10 +2163,10 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
             ? [routeData.resolvedOrigin.lat, routeData.resolvedOrigin.lng]
             : routeData.route[0] || null
         );
-        setIsTracking(false);
         resetDeviationState();
         stopDeviationChecks();
         fitMapToRoute(routeData.route, latestPositionRef.current ? [latestPositionRef.current] : []);
+        await applyRouteSelection(suggestions[0], snappedDestination, 0, suggestions);
       } catch (error) {
         setJourneyError(error.message || 'Could not plan the route.');
       } finally {
@@ -1890,6 +2180,7 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
       resetDeviationState,
       searchResults,
       stopDeviationChecks,
+      applyRouteSelection,
       journeyMode,
     ]
   );
@@ -2632,6 +2923,121 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
             <Text style={styles.modalTitle}>{safetyPrompt?.title || 'Are you safe?'}</Text>
             <Text style={styles.modalBody}>{safetyPrompt?.message}</Text>
 
+            {safetyPrompt?.type === 'deviation' ? (
+              <View style={styles.modalMicCard}>
+                <View style={styles.modalMicHeader}>
+                  <View style={styles.modalMicTitleRow}>
+                    <Ionicons
+                      name={audioDebugState.isAnalyzing ? 'mic' : 'mic-off'}
+                      size={18}
+                      color={audioDebugState.isAnalyzing ? '#7b57d1' : '#8f8f96'}
+                    />
+                    <Text style={styles.modalMicTitle}>Emergency microphone</Text>
+                  </View>
+                  <View
+                    style={[
+                      styles.modalMicBadge,
+                      audioDebugState.isAnalyzing && styles.modalMicBadgeActive,
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.modalMicBadgeText,
+                        audioDebugState.isAnalyzing && styles.modalMicBadgeTextActive,
+                      ]}
+                    >
+                      {audioDebugState.isAnalyzing ? 'Listening' : 'Stopped'}
+                    </Text>
+                  </View>
+                </View>
+
+                <Text style={styles.modalMicText}>
+                  Audio monitoring stays on automatically during deviation until safety is confirmed or emergency audio is detected.
+                </Text>
+
+                <Text style={styles.modalMicMeta}>
+                  Meter: {formatAudioMeterValue(audioDebugState.latestMetering)} | Avg: {formatAudioMeterValue(audioDebugState.averageMetering)}
+                </Text>
+              </View>
+            ) : null}
+
+            {isDeviationAudioUiVisible && safetyPrompt?.type === 'deviation' ? (
+              <View style={styles.debugCard}>
+                <View style={styles.debugHeader}>
+                  <View>
+                    <Text style={styles.cardTitle}>Emergency Audio Debug</Text>
+                    <Text style={styles.cardSubtitle}>
+                      Simulation is available only while route deviation escalation is active.
+                    </Text>
+                  </View>
+                  <View
+                    style={[
+                      styles.debugBadge,
+                      audioDebugState.isAnalyzing && styles.debugBadgeActive,
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.debugBadgeText,
+                        audioDebugState.isAnalyzing && styles.debugBadgeTextActive,
+                      ]}
+                    >
+                      {audioDebugState.isAnalyzing ? 'Listening' : 'Stopped'}
+                    </Text>
+                  </View>
+                </View>
+
+                <View style={styles.debugBlock}>
+                  <Text style={styles.debugLabel}>Last Transcript</Text>
+                  <Text style={styles.debugValue}>
+                    {audioDebugState.lastTranscript || 'No transcript yet'}
+                  </Text>
+                </View>
+
+                <View style={styles.debugBlock}>
+                  <Text style={styles.debugLabel}>Matched Keywords</Text>
+                  <Text style={styles.debugValue}>
+                    {audioDebugState.matchedKeywords?.length
+                      ? audioDebugState.matchedKeywords.join(', ')
+                      : 'None'}
+                  </Text>
+                </View>
+
+                <View style={styles.debugBlock}>
+                  <Text style={styles.debugLabel}>Last Event</Text>
+                  <Text style={styles.debugValue}>{audioDebugState.lastEvent || 'idle'}</Text>
+                </View>
+
+                <TextInput
+                  value={audioSimulationInput}
+                  onChangeText={setAudioSimulationInput}
+                  placeholder="Simulate transcript"
+                  placeholderTextColor="#9f9bb2"
+                  style={styles.debugInput}
+                />
+
+                <View style={styles.debugActionRow}>
+                  <TouchableOpacity
+                    style={styles.debugActionButton}
+                    onPress={() => {
+                      AudioAnalysisService.simulateTranscript(audioSimulationInput);
+                    }}
+                  >
+                    <Text style={styles.debugActionText}>Run Simulation</Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={[styles.debugActionButton, styles.debugActionButtonSecondary]}
+                    onPress={() => {
+                      setAudioSimulationInput('');
+                    }}
+                  >
+                    <Text style={styles.debugActionTextSecondary}>Clear</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            ) : null}
+
             <TouchableOpacity
               style={styles.modalPrimary}
               onPress={sendPromptSOS}
@@ -2655,14 +3061,118 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
             <View style={[styles.alertIconWrap, styles.safeReasonIconWrap]}>
               <Ionicons name="create-outline" size={28} color="#fff" />
             </View>
-            <Text style={styles.modalTitle}>Reason for deviation</Text>
-            <Text style={styles.modalBody}>
-              Tell us why you moved away from the route. Example: changing shortcut or avoiding traffic.
-            </Text>
+            <Text style={styles.modalTitle}>{safeReasonModalContent.title}</Text>
+            <Text style={styles.modalBody}>{safeReasonModalContent.body}</Text>
             <Text style={styles.securityCaption}>{SECURITY_PASSWORD_DESCRIPTION}</Text>
 
+            {safeReasonPrompt?.type === 'deviation' ? (
+              <View style={styles.modalMicCard}>
+                <View style={styles.modalMicHeader}>
+                  <View style={styles.modalMicTitleRow}>
+                    <Ionicons
+                      name={audioDebugState.isAnalyzing ? 'mic' : 'mic-off'}
+                      size={18}
+                      color={audioDebugState.isAnalyzing ? '#7b57d1' : '#8f8f96'}
+                    />
+                    <Text style={styles.modalMicTitle}>Emergency microphone</Text>
+                  </View>
+                  <View
+                    style={[
+                      styles.modalMicBadge,
+                      audioDebugState.isAnalyzing && styles.modalMicBadgeActive,
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.modalMicBadgeText,
+                        audioDebugState.isAnalyzing && styles.modalMicBadgeTextActive,
+                      ]}
+                    >
+                      {audioDebugState.isAnalyzing ? 'Listening' : 'Stopped'}
+                    </Text>
+                  </View>
+                </View>
+
+                <Text style={styles.modalMicMeta}>
+                  Meter: {formatAudioMeterValue(audioDebugState.latestMetering)} | Avg: {formatAudioMeterValue(audioDebugState.averageMetering)}
+                </Text>
+              </View>
+            ) : null}
+
+            {isDeviationAudioUiVisible && safeReasonPrompt?.type === 'deviation' ? (
+              <View style={styles.debugCard}>
+                <View style={styles.debugHeader}>
+                  <View>
+                    <Text style={styles.cardTitle}>Emergency Audio Debug</Text>
+                    <Text style={styles.cardSubtitle}>
+                      Route deviation is active, so simulation is available here.
+                    </Text>
+                  </View>
+                  <View
+                    style={[
+                      styles.debugBadge,
+                      audioDebugState.isAnalyzing && styles.debugBadgeActive,
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.debugBadgeText,
+                        audioDebugState.isAnalyzing && styles.debugBadgeTextActive,
+                      ]}
+                    >
+                      {audioDebugState.isAnalyzing ? 'Listening' : 'Stopped'}
+                    </Text>
+                  </View>
+                </View>
+
+                <View style={styles.debugBlock}>
+                  <Text style={styles.debugLabel}>Last Transcript</Text>
+                  <Text style={styles.debugValue}>
+                    {audioDebugState.lastTranscript || 'No transcript yet'}
+                  </Text>
+                </View>
+
+                <View style={styles.debugBlock}>
+                  <Text style={styles.debugLabel}>Matched Keywords</Text>
+                  <Text style={styles.debugValue}>
+                    {audioDebugState.matchedKeywords?.length
+                      ? audioDebugState.matchedKeywords.join(', ')
+                      : 'None'}
+                  </Text>
+                </View>
+
+                <TextInput
+                  value={audioSimulationInput}
+                  onChangeText={setAudioSimulationInput}
+                  placeholder="Simulate transcript"
+                  placeholderTextColor="#9a93ad"
+                  style={styles.debugInput}
+                />
+
+                <View style={styles.debugActionRow}>
+                  <TouchableOpacity
+                    style={styles.debugActionButton}
+                    onPress={() => {
+                      AudioAnalysisService.simulateTranscript(audioSimulationInput);
+                    }}
+                  >
+                    <Text style={styles.debugActionText}>Run Simulation</Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={[styles.debugActionButton, styles.debugActionButtonSecondary]}
+                    onPress={() => {
+                      setAudioSimulationInput('');
+                    }}
+                  >
+                    <Text style={styles.debugActionTextSecondary}>Clear</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            ) : null}
+
             <View style={styles.reasonChipRow}>
-              {SAFE_DEVIATION_REASON_OPTIONS.map((option) => (
+              {safeReasonModalContent.options.map((option) => (
                 <TouchableOpacity
                   key={option}
                   style={styles.reasonChip}
@@ -2676,7 +3186,7 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
             <TextInput
               value={safeReasonText}
               onChangeText={setSafeReasonText}
-              placeholder="Reason for deviation"
+              placeholder={safeReasonModalContent.placeholder}
               placeholderTextColor="#9a93ad"
               style={styles.reasonInput}
               multiline
@@ -2845,6 +3355,168 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 18,
     fontWeight: '600',
+  },
+  debugCard: {
+    width: '100%',
+    backgroundColor: '#fff',
+    borderRadius: 24,
+    padding: 18,
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: '#d8d2e8',
+  },
+  debugHeader: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  debugBadge: {
+    borderRadius: 999,
+    backgroundColor: '#f1f5f9',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  debugBadgeActive: {
+    backgroundColor: '#efe8ff',
+  },
+  debugBadgeText: {
+    color: '#64748b',
+    fontSize: 11,
+    fontWeight: '800',
+  },
+  debugBadgeTextActive: {
+    color: '#7b57d1',
+  },
+  debugMetricGrid: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 14,
+  },
+  debugMetricCard: {
+    flex: 1,
+    borderRadius: 16,
+    backgroundColor: '#f8fafc',
+    padding: 12,
+  },
+  debugMetricLabel: {
+    color: '#64748b',
+    fontSize: 11,
+    fontWeight: '800',
+    textTransform: 'uppercase',
+  },
+  debugMetricValue: {
+    marginTop: 6,
+    color: '#111827',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  debugBlock: {
+    marginTop: 12,
+  },
+  debugLabel: {
+    color: '#64748b',
+    fontSize: 11,
+    fontWeight: '800',
+    textTransform: 'uppercase',
+  },
+  debugValue: {
+    marginTop: 5,
+    color: '#1f2937',
+    fontSize: 13,
+    lineHeight: 18,
+    fontWeight: '700',
+  },
+  debugInput: {
+    marginTop: 14,
+    borderRadius: 16,
+    backgroundColor: '#f8fafc',
+    paddingHorizontal: 14,
+    paddingVertical: 13,
+    color: '#111',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  debugActionRow: {
+    flexDirection: 'row',
+    gap: 10,
+    marginTop: 12,
+  },
+  debugActionButton: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 16,
+    backgroundColor: '#7b57d1',
+    paddingVertical: 13,
+  },
+  debugActionButtonSecondary: {
+    backgroundColor: '#f2ebff',
+  },
+  debugActionText: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  debugActionTextSecondary: {
+    color: '#6a56a6',
+    fontSize: 13,
+    fontWeight: '800',
+  },
+  modalMicCard: {
+    width: '100%',
+    marginTop: 18,
+    borderRadius: 18,
+    backgroundColor: '#f8f5ff',
+    padding: 14,
+    borderWidth: 1,
+    borderColor: '#e9e1ff',
+  },
+  modalMicHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  modalMicTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  modalMicTitle: {
+    color: '#24153f',
+    fontSize: 14,
+    fontWeight: '800',
+  },
+  modalMicBadge: {
+    borderRadius: 999,
+    backgroundColor: '#edf2f7',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  modalMicBadgeActive: {
+    backgroundColor: '#efe8ff',
+  },
+  modalMicBadgeText: {
+    color: '#64748b',
+    fontSize: 11,
+    fontWeight: '800',
+  },
+  modalMicBadgeTextActive: {
+    color: '#7b57d1',
+  },
+  modalMicText: {
+    marginTop: 10,
+    color: '#5c5b66',
+    fontSize: 12,
+    lineHeight: 18,
+    fontWeight: '600',
+  },
+  modalMicMeta: {
+    marginTop: 10,
+    color: '#6a56a6',
+    fontSize: 12,
+    fontWeight: '700',
   },
   vehicleScanLoadingRow: {
     marginTop: 14,

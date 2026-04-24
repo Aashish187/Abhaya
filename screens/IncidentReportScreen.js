@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   ActivityIndicator,
@@ -17,9 +17,12 @@ import * as Location from 'expo-location';
 import { useAuth } from '../context/AuthContext';
 import { useReport } from '../context/ReportContext';
 import { incidentAPI, videoAPI } from '../services/api';
+import AudioAnalysisService from '../services/AudioAnalysisService';
+import { getEmergencyEmailAddresses } from '../services/emergencyEmailContacts';
 import { saveIncidentReport } from '../services/reportStorage';
 
-const RECORD_SECONDS = 10;
+const RECORD_SECONDS = 7;
+const CAMERA_READY_DELAY_MS = 120;
 const MAX_VIDEO_BYTES = 3 * 1024 * 1024;
 const EMAIL_FAILURE_MESSAGE =
   'Report saved, but emergency email could not be sent. Check backend Gmail settings in backend/.env.';
@@ -45,12 +48,114 @@ const formatResolvedAddress = (result) => {
   return [primary, secondary.join(', ')].filter(Boolean).join(', ');
 };
 
+const getUserDisplayName = (user) =>
+  String(user?.displayName || user?.name || 'Abhaya User').trim() || 'Abhaya User';
+
+const getUserPhone = (user) =>
+  String(user?.phone || user?.phoneNumber || user?.mobile || user?.contact || '').trim();
+
+const isFiniteCoordinate = (value) => Number.isFinite(Number(value));
+
+const mergeIncidentReportSeed = ({
+  generatedIncidentId,
+  createdAt,
+  triggerType,
+  triggerReason,
+  displayName,
+  phone,
+  email,
+  seed,
+}) => {
+  const baseReport = {
+    incidentId: generatedIncidentId,
+    createdAt,
+    status: 'ACTIVE',
+    user: {
+      name: displayName || 'Abhaya User',
+      phone: phone || null,
+      email: email || null,
+    },
+    location: {
+      lat: null,
+      lng: null,
+      address: '',
+      source: 'device_capture',
+    },
+    trigger: {
+      type: triggerType,
+      riskScore: 'HIGH',
+      reason: triggerReason || null,
+    },
+    vehicle: null,
+    journey: null,
+    zone: null,
+    evidence: [],
+    timeline: [
+      'SOS triggered',
+      triggerReason ? `Trigger reason: ${triggerReason}` : '',
+    ].filter(Boolean),
+    notification: {
+      sent: false,
+    },
+  };
+
+  const merged = {
+    ...baseReport,
+    ...(seed || {}),
+    incidentId: seed?.incidentId || generatedIncidentId,
+    createdAt: seed?.createdAt || createdAt,
+    status: seed?.status || 'ACTIVE',
+    user: {
+      ...baseReport.user,
+      ...(seed?.user || {}),
+      name: seed?.user?.name || baseReport.user.name,
+      phone: seed?.user?.phone || baseReport.user.phone,
+      email: seed?.user?.email || baseReport.user.email,
+    },
+    location: {
+      ...baseReport.location,
+      ...(seed?.location || {}),
+      lat: isFiniteCoordinate(seed?.location?.lat) ? Number(seed.location.lat) : baseReport.location.lat,
+      lng: isFiniteCoordinate(seed?.location?.lng) ? Number(seed.location.lng) : baseReport.location.lng,
+      address: seed?.location?.address || baseReport.location.address,
+    },
+    trigger: {
+      ...baseReport.trigger,
+      ...(seed?.trigger || {}),
+      type: seed?.trigger?.type || baseReport.trigger.type,
+      riskScore: seed?.trigger?.riskScore || baseReport.trigger.riskScore,
+      reason: seed?.trigger?.reason || baseReport.trigger.reason,
+    },
+    vehicle:
+      seed?.vehicle || seed?.vehicleDetails
+        ? {
+            ...(seed?.vehicle || seed?.vehicleDetails || {}),
+          }
+        : null,
+    journey: seed?.journey ? { ...seed.journey } : null,
+    zone: seed?.zone ? { ...seed.zone } : null,
+    destination: seed?.destination ? { ...seed.destination } : null,
+    evidence: Array.isArray(seed?.evidence) ? [...seed.evidence] : [],
+    timeline:
+      Array.isArray(seed?.timeline) && seed.timeline.length
+        ? seed.timeline.filter(Boolean)
+        : baseReport.timeline,
+    notification: {
+      ...baseReport.notification,
+      ...(seed?.notification || {}),
+    },
+  };
+
+  return merged;
+};
+
 export default function IncidentReportScreen({ navigation, route }) {
   const { user } = useAuth();
   const { setLatestReport } = useReport();
-  const displayName = user?.displayName || user?.name || 'Priya Sharma';
-  const phone =
-    user?.phone || user?.phoneNumber || user?.mobile || user?.contact || '98XXXXXX90';
+  const displayName = getUserDisplayName(user);
+  const phone = getUserPhone(user);
+  const email = String(user?.email || '').trim() || null;
+  const reportSeed = route?.params?.reportSeed || null;
 
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [micPermission, requestMicPermission] = useMicrophonePermissions();
@@ -62,16 +167,22 @@ export default function IncidentReportScreen({ navigation, route }) {
   const [recorderVisible, setRecorderVisible] = useState(false);
   const [phase, setPhase] = useState('idle'); // idle | preparing | recording | uploading | success
   const [flowError, setFlowError] = useState('');
+  const [currentReport, setCurrentReport] = useState(null);
+  const isAutoEvidenceFlow = Boolean(route?.params?.autoStartEvidence);
+  const isRecorderActive =
+    recorderVisible || ['preparing', 'recording', 'uploading', 'success'].includes(phase);
+  const shouldHideReportContent = isAutoEvidenceFlow && isRecorderActive;
 
   const closeRecorder = () => {
     try {
       cameraRef.current?.stopRecording?.();
     } catch {}
+    AudioAnalysisService.stopAnalysis().catch(() => {});
     setRecorderVisible(false);
     setPhase('idle');
   };
 
-  const triggerEvidence = async ({ triggerType = 'SOS' } = {}) => {
+  const triggerEvidence = async ({ triggerType = 'SOS', triggerReason = '' } = {}) => {
     setFlowError('');
 
     const cameraGranted =
@@ -95,72 +206,95 @@ export default function IncidentReportScreen({ navigation, route }) {
 
     const createdAt = new Date().toISOString();
     const generatedIncidentId = createIncidentId();
-    let liveLocation = {
-      lat: null,
-      lng: null,
-      address: 'Current location unavailable',
-    };
 
-    try {
-      const permission = await Location.requestForegroundPermissionsAsync();
-      if (permission?.granted) {
+    reportRef.current = mergeIncidentReportSeed({
+      generatedIncidentId,
+      createdAt,
+      triggerType,
+      triggerReason,
+      displayName,
+      phone,
+      email,
+      seed: reportSeed,
+    });
+
+    setCurrentReport(reportRef.current);
+    setIncidentId(reportRef.current.incidentId);
+    setRecorderVisible(true);
+    setPhase('preparing');
+
+    Promise.resolve()
+      .then(async () => {
+        const currentLat = Number(reportRef.current?.location?.lat);
+        const currentLng = Number(reportRef.current?.location?.lng);
+        const hasSeedCoordinates =
+          Number.isFinite(currentLat) && Number.isFinite(currentLng);
+
+        if (hasSeedCoordinates) {
+          const results = await Location.reverseGeocodeAsync({
+            latitude: currentLat,
+            longitude: currentLng,
+          });
+
+          reportRef.current = {
+            ...(reportRef.current || {}),
+            location: {
+              ...(reportRef.current?.location || {}),
+              address:
+                formatResolvedAddress(Array.isArray(results) ? results[0] : null) ||
+                reportRef.current?.location?.address ||
+                'Live journey location captured',
+            },
+          };
+          setCurrentReport({ ...(reportRef.current || {}) });
+          return;
+        }
+
+        const permission = await Location.requestForegroundPermissionsAsync();
+        if (!permission?.granted) {
+          return;
+        }
+
         const position = await Location.getCurrentPositionAsync({
-          accuracy: Location.Accuracy.Highest,
+          accuracy: Location.Accuracy.Balanced,
         });
         const results = await Location.reverseGeocodeAsync({
           latitude: position.coords.latitude,
           longitude: position.coords.longitude,
         });
 
-        liveLocation = {
-          lat: position.coords.latitude,
-          lng: position.coords.longitude,
-          address:
-            formatResolvedAddress(Array.isArray(results) ? results[0] : null) ||
-            'Live location captured',
+        reportRef.current = {
+          ...(reportRef.current || {}),
+          location: {
+            ...(reportRef.current?.location || {}),
+            lat: position.coords.latitude,
+            lng: position.coords.longitude,
+            address:
+              formatResolvedAddress(Array.isArray(results) ? results[0] : null) ||
+              reportRef.current?.location?.address ||
+              'Live location captured',
+            source: reportRef.current?.location?.source || 'device_capture',
+          },
         };
-      }
-    } catch {}
-
-    reportRef.current = {
-      incidentId: generatedIncidentId,
-      createdAt,
-      status: 'ACTIVE',
-      user: {
-        name: displayName || 'Demo User',
-        phone: phone || '0000000000',
-      },
-      location: {
-        lat: liveLocation.lat,
-        lng: liveLocation.lng,
-        address: liveLocation.address,
-      },
-      trigger: {
-        type: triggerType,
-        riskScore: 'HIGH',
-      },
-      evidence: [],
-      timeline: ['SOS triggered'],
-      notification: {
-        sent: false,
-      },
-    };
-
-    setIncidentId(generatedIncidentId);
-
-    setRecorderVisible(true);
-    setPhase('preparing');
+        setCurrentReport({ ...(reportRef.current || {}) });
+      })
+      .catch(() => {});
   };
+
+  useEffect(() => {
+    AudioAnalysisService.stopAnalysis().catch(() => {});
+  }, []);
 
   useEffect(() => {
     const shouldAutoStart = Boolean(route?.params?.autoStartEvidence);
     const triggerType = route?.params?.triggerType || 'SOS';
+    const triggerReason = route?.params?.triggerReason || '';
 
     if (!shouldAutoStart || autoStartedRef.current) return;
     autoStartedRef.current = true;
-    triggerEvidence({ triggerType });
+    triggerEvidence({ triggerType, triggerReason });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [route?.params?.autoStartEvidence, route?.params?.triggerType]);
+  }, [route?.params?.autoStartEvidence, route?.params?.triggerReason, route?.params?.triggerType]);
 
   useEffect(() => {
     const run = async () => {
@@ -169,8 +303,8 @@ export default function IncidentReportScreen({ navigation, route }) {
       try {
         setPhase('recording');
 
-        // Give the camera view a moment to mount before recording.
-        await new Promise((resolve) => setTimeout(resolve, 350));
+        // Give the camera view a short moment to mount before recording.
+        await new Promise((resolve) => setTimeout(resolve, CAMERA_READY_DELAY_MS));
 
         const camera = cameraRef.current;
         if (!camera?.recordAsync) {
@@ -236,7 +370,8 @@ export default function IncidentReportScreen({ navigation, route }) {
           timeline: [...(reportRef.current?.timeline || []), 'Video uploaded'],
         };
 
-        const emailResult = await incidentAPI.sendEmergencyEmail(updatedReport);
+        const emailRecipients = await getEmergencyEmailAddresses();
+        const emailResult = await incidentAPI.sendEmergencyEmail(updatedReport, emailRecipients);
         const finalReport = {
           ...updatedReport,
           notification: { sent: Boolean(emailResult?.success) },
@@ -244,9 +379,10 @@ export default function IncidentReportScreen({ navigation, route }) {
 
         await saveIncidentReport(finalReport);
         await setLatestReport(finalReport);
+        setCurrentReport(finalReport);
 
         setPhase('success');
-        await new Promise((resolve) => setTimeout(resolve, 650));
+        await new Promise((resolve) => setTimeout(resolve, 400));
 
         closeRecorder();
         navigation.replace('ReportDetails', {
@@ -274,6 +410,44 @@ export default function IncidentReportScreen({ navigation, route }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [recorderVisible, phase]);
 
+  const reportDateText = useMemo(() => {
+    try {
+      const date = currentReport?.createdAt ? new Date(currentReport.createdAt) : new Date();
+      return `Date: ${date.toLocaleDateString()} | ${date.toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit',
+      })}`;
+    } catch {
+      return 'Date unavailable';
+    }
+  }, [currentReport?.createdAt]);
+
+  const locationSummary = useMemo(() => {
+    const lat = Number(currentReport?.location?.lat);
+    const lng = Number(currentReport?.location?.lng);
+
+    if (Number.isFinite(lat) && Number.isFinite(lng)) {
+      return `Lat: ${lat.toFixed(2)} | Long: ${lng.toFixed(2)}`;
+    }
+
+    return 'Current location unavailable';
+  }, [currentReport?.location?.lat, currentReport?.location?.lng]);
+
+  const riskScore = currentReport?.trigger?.riskScore || 'HIGH';
+  const videoEvidenceAvailable = Array.isArray(currentReport?.evidence)
+    ? currentReport.evidence.some((item) => item?.type === 'video' && item?.url)
+    : false;
+  const currentVehicle = currentReport?.vehicle || null;
+  const vehicleSummary = [
+    currentVehicle?.vehicleType,
+    currentVehicle?.vehicleBrand,
+    currentVehicle?.vehicleModel,
+  ]
+    .filter(Boolean)
+    .join(' | ');
+  const currentUserName = currentReport?.user?.name || displayName;
+  const currentUserPhone = currentReport?.user?.phone || phone || 'Phone unavailable';
+
   return (
     <SafeAreaView style={styles.container} edges={['top', 'left', 'right']}>
       <StatusBar barStyle="dark-content" backgroundColor="#fbf9ff" />
@@ -290,7 +464,8 @@ export default function IncidentReportScreen({ navigation, route }) {
         <View style={{ width: 24 }} />
       </View>
 
-      <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
+      {!shouldHideReportContent ? (
+        <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
         <View style={styles.reportCard}>
           {/* Title Section */}
           <View style={styles.sectionHeader}>
@@ -299,7 +474,7 @@ export default function IncidentReportScreen({ navigation, route }) {
             </View>
             <View>
               <Text style={styles.reportTitle}>ABHAYA INCIDENT REPORT</Text>
-              <Text style={styles.reportDate}>Date: 18 Apr 2026 | 11:42 PM</Text>
+              <Text style={styles.reportDate}>{reportDateText}</Text>
             </View>
           </View>
 
@@ -311,8 +486,11 @@ export default function IncidentReportScreen({ navigation, route }) {
               <Ionicons name="person" size={16} color="#4da6ff" />
               <Text style={styles.sectionTitle}>User Information</Text>
             </View>
-            <Text style={styles.dataPrimary}>{displayName}</Text>
-            <Text style={styles.dataSecondary}>Mobile: 98XXXXXX90</Text>
+            <Text style={styles.dataPrimary}>{currentUserName}</Text>
+            <Text style={styles.dataSecondary}>Mobile: {currentUserPhone}</Text>
+            {currentReport?.user?.email ? (
+              <Text style={styles.dataSecondary}>Email: {currentReport.user.email}</Text>
+            ) : null}
           </View>
 
           <View style={styles.dividerLight} />
@@ -323,8 +501,12 @@ export default function IncidentReportScreen({ navigation, route }) {
               <Ionicons name="car" size={16} color="#ed5565" />
               <Text style={styles.sectionTitle}>Vehicle Details</Text>
             </View>
-            <Text style={styles.dataPrimary}>MH12 AB 1234</Text>
-            <Text style={styles.dataSecondary}>Driver: Ramesh Kumar</Text>
+            <Text style={styles.dataPrimary}>
+              {currentVehicle?.plateNumber || vehicleSummary || 'No linked vehicle scan'}
+            </Text>
+            {vehicleSummary ? (
+              <Text style={styles.dataSecondary}>Vehicle: {vehicleSummary}</Text>
+            ) : null}
             <Text style={styles.dataSecondary}>License: Valid ✅</Text>
           </View>
 
@@ -336,10 +518,12 @@ export default function IncidentReportScreen({ navigation, route }) {
               <Ionicons name="location" size={16} color="#ed5565" />
               <Text style={styles.sectionTitle}>Last Known Location</Text>
             </View>
-            <Text style={styles.dataPrimary}>Lat: 21.14 | Long: 79.08</Text>
+            <Text style={styles.dataPrimary}>{locationSummary}</Text>
             <TouchableOpacity style={styles.mapLink}>
               <Ionicons name="map" size={14} color="#7b57d1" />
-              <Text style={styles.mapLinkText}>View on Map</Text>
+              <Text style={styles.mapLinkText}>
+                {currentReport?.location?.address || 'View on Map'}
+              </Text>
             </TouchableOpacity>
           </View>
 
@@ -361,7 +545,7 @@ export default function IncidentReportScreen({ navigation, route }) {
                 <Ionicons name="eye" size={14} color="#7b57d1" />
               </View>
               <Text style={styles.evidenceName}>Video Evidence</Text>
-              <Text style={styles.evidenceMeta}>View</Text>
+              <Text style={styles.evidenceMeta}>{videoEvidenceAvailable ? 'View' : 'Pending'}</Text>
             </TouchableOpacity>
 
             <View style={styles.evidenceFile}>
@@ -377,7 +561,7 @@ export default function IncidentReportScreen({ navigation, route }) {
           <View style={styles.riskBadge}>
             <Text style={styles.riskBadgeText}>Risk Score</Text>
             <View style={styles.riskBadgeValueWrap}>
-              <Text style={styles.riskBadgeValue}>HIGH</Text>
+              <Text style={styles.riskBadgeValue}>{riskScore}</Text>
               <View style={styles.riskDot} />
             </View>
           </View>
@@ -398,8 +582,10 @@ export default function IncidentReportScreen({ navigation, route }) {
           <Ionicons name="download-outline" size={18} color="#fff" />
           <Text style={styles.btnText}>Download Report</Text>
         </TouchableOpacity>
-        
-      </ScrollView>
+        </ScrollView>
+      ) : (
+        <View style={styles.recorderScreenPlaceholder} />
+      )}
 
       <Modal visible={recorderVisible} transparent animationType="fade" onRequestClose={closeRecorder}>
         <View style={styles.recorderBackdrop}>
@@ -459,6 +645,7 @@ const styles = StyleSheet.create({
   backButton: { padding: 4 },
   headerTitle: { fontSize: 20, fontWeight: '800', color: '#111' },
   content: { paddingHorizontal: 20, paddingBottom: 40 },
+  recorderScreenPlaceholder: { flex: 1 },
   
   reportCard: { backgroundColor: '#fff', borderRadius: 24, padding: 24, shadowColor: '#14092c', shadowOffset: { width: 0, height: 8 }, shadowOpacity: 0.05, shadowRadius: 20, elevation: 4, marginBottom: 24, marginTop: 8 },
   sectionHeader: { flexDirection: 'row', alignItems: 'center', gap: 16 },

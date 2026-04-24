@@ -7,11 +7,12 @@ const router = express.Router();
 router.post('/', async (req, res) => {
   try {
     const report = req?.body?.report;
+    const recipients = Array.isArray(req?.body?.recipients) ? req.body.recipients : DEFAULT_RECIPIENTS;
     if (!report || typeof report !== 'object') {
       return res.status(400).json({ success: false, error: 'report is required.' });
     }
 
-    const result = await sendEmergencyEmail(report, DEFAULT_RECIPIENTS);
+    const result = await sendEmergencyEmail(report, recipients);
 
     if (!result?.success) {
       logger.warn('Emergency email route failed', {

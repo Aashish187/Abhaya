@@ -468,6 +468,15 @@ export default function HomeScreen({ navigation }) {
                 </Text>
               </View>
 
+              {riskData?.insideDangerZone ? (
+                <View style={styles.riskBulletRow}>
+                  <View style={[styles.riskBullet, { backgroundColor: '#fca5a5' }]} />
+                  <Text style={styles.riskBulletText}>
+                    Danger zone: Inside {riskData?.activeZone?.name || 'high-risk area'}
+                  </Text>
+                </View>
+              ) : null}
+
               <View style={styles.riskBulletRow}>
                 <View style={[styles.riskBullet, { backgroundColor: riskData?.timeRisk > 50 ? '#fca5a5' : '#49d160' }]} />
                 <Text style={styles.riskBulletText}>

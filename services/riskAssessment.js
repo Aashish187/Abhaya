@@ -45,41 +45,76 @@ const getTimeMultiplier = () => {
  * Get current location's crime zone risk
  * Also returns baseline risk if in Kolhapur
  */
-const getLocationRisk = (latitude, longitude) => {
-  if (!latitude || !longitude) return 0;
+const getLocationRiskDetails = (latitude, longitude) => {
+  if (!latitude || !longitude) {
+    return {
+      locationRisk: 0,
+      insideZone: false,
+      insideDangerZone: false,
+      activeZone: null,
+    };
+  }
 
   let maxRisk = 0;
+  let insideZone = false;
+  let insideDangerZone = false;
+  let activeZone = null;
 
   // Check proximity to crime zones
   crimeZones.forEach((zone) => {
     const distance = calculateDistance(latitude, longitude, zone.latitude, zone.longitude);
+    const isInsideZone = distance <= zone.radius;
+    const isDangerZone = zone.risk === 'high' || zone.risk === 'medium';
 
-    // Check if user is within the crime zone radius
-    if (distance <= zone.radius) {
-      const riskValue = zone.risk === 'high' ? 75 : zone.risk === 'medium' ? 50 : 25;
-      maxRisk = Math.max(maxRisk, riskValue);
+    if (isInsideZone) {
+      insideZone = true;
+      if (isDangerZone) {
+        insideDangerZone = true;
+      }
+
+      const riskValue =
+        zone.risk === 'high' ? 95 : zone.risk === 'medium' ? 82 : 45;
+
+      if (riskValue >= maxRisk) {
+        maxRisk = riskValue;
+        activeZone = {
+          ...zone,
+          distance: Math.round(distance),
+          insideZone: true,
+        };
+      }
     } else if (distance <= zone.radius * 2) {
-      // Nearby zone: give partial risk
-      const baseRisk = zone.risk === 'high' ? 75 : zone.risk === 'medium' ? 50 : 25;
-      const proximityRisk = baseRisk * 0.5;
-      maxRisk = Math.max(maxRisk, proximityRisk);
+      const baseRisk = zone.risk === 'high' ? 75 : zone.risk === 'medium' ? 55 : 25;
+      const proximityRisk = baseRisk * 0.6;
+
+      if (proximityRisk >= maxRisk) {
+        maxRisk = proximityRisk;
+        activeZone = {
+          ...zone,
+          distance: Math.round(distance),
+          insideZone: false,
+        };
+      }
     }
   });
 
   // If not in any crime zone but in Kolhapur area, apply baseline risk
-  // Kolhapur coordinates approx: 16.70 N, 74.23 E
   if (maxRisk === 0) {
     const kolhapurLat = 16.70;
     const kolhapurLon = 74.23;
     const distToKolhapur = calculateDistance(latitude, longitude, kolhapurLat, kolhapurLon);
-    
-    // If within 10km of Kolhapur center, apply baseline urban risk
+
     if (distToKolhapur < 10000) {
-      maxRisk = 20; // Baseline ambient risk for urban area
+      maxRisk = 20;
     }
   }
 
-  return maxRisk;
+  return {
+    locationRisk: maxRisk,
+    insideZone,
+    insideDangerZone,
+    activeZone,
+  };
 };
 
 /**
@@ -149,7 +184,8 @@ export const calculateRiskPercentage = (locationData, journeyData) => {
   } = journeyData || {};
 
   // ===== PARAMETER 1: LOCATION RISK (0-100) =====
-  const locationRisk = getLocationRisk(latitude, longitude);
+  const locationRiskDetails = getLocationRiskDetails(latitude, longitude);
+  const locationRisk = locationRiskDetails.locationRisk;
 
   // ===== PARAMETER 2: TIME-BASED RISK (0-100) =====
   const hour = new Date().getHours();
@@ -204,6 +240,12 @@ export const calculateRiskPercentage = (locationData, journeyData) => {
     finalRisk = Math.min(100, averageRisk * 1.15);
   }
 
+  if (locationRiskDetails.insideDangerZone) {
+    finalRisk = Math.max(finalRisk, locationRisk >= 90 ? 88 : 76);
+  } else if (locationRiskDetails.insideZone) {
+    finalRisk = Math.max(finalRisk, 52);
+  }
+
   // Cap at 100
   finalRisk = Math.min(100, Math.max(0, finalRisk));
 
@@ -230,6 +272,9 @@ export const calculateRiskPercentage = (locationData, journeyData) => {
     activityRisk: Math.round(activityRisk),
     deviationPercentage: Math.round(deviationPercentage),
     isDeviated,
+    insideDangerZone: locationRiskDetails.insideDangerZone,
+    insideZone: locationRiskDetails.insideZone,
+    activeZone: locationRiskDetails.activeZone,
     timeOfDay: getTimeOfDay(),
     nearbyZones: getNearbyZones(latitude, longitude),
   };

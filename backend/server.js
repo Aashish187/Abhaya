@@ -41,12 +41,14 @@ const vehicleObservationRoutes = require('./routes/vehicleObservations');
 const incidentRoutes = require('./routes/incidents');
 const emailRoutes = require('./routes/email');
 const userVideoRoutes = require('./routes/userVideos');
+const audioRoutes = require('./routes/audio');
 
 app.use('/api/auth', authRoutes);
 app.use('/api/journey', journeyRoutes);
 app.use('/api/history', historyRoutes);
 app.use('/api/vehicle-observations', vehicleObservationRoutes);
 app.use('/api/incidents', incidentRoutes);
+app.use('/api/audio', audioRoutes);
 app.use(userVideoRoutes);
 app.use('/api', userVideoRoutes);
 
@@ -110,6 +112,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log('GET    /api/vehicle-observations');
   console.log('POST   /api/vehicle-observations');
   console.log('POST   /api/save-video');
+  console.log('POST   /api/audio/transcribe');
   console.log('GET    /api/user-videos/:userId');
   console.log('DELETE /api/video/:id');
   console.log('POST   /send-email');

@@ -12,10 +12,16 @@ const ORS_DIRECTION_URLS = {
   walking: 'https://api.openrouteservice.org/v2/directions/foot-walking',
 };
 const FIREBASE_TIMEOUT_MS = Number(process.env.FIREBASE_TIMEOUT_MS || 8000);
+const ROUTE_REQUEST_TIMEOUT_MS = Number(process.env.ROUTE_REQUEST_TIMEOUT_MS || 4500);
+const GEOCODE_CACHE_TTL_MS = Number(process.env.GEOCODE_CACHE_TTL_MS || 10 * 60 * 1000);
+const ROUTE_CACHE_TTL_MS = Number(process.env.ROUTE_CACHE_TTL_MS || 3 * 60 * 1000);
 const DEVIATION_THRESHOLD_METRES = Number(
   process.env.DEVIATION_THRESHOLD_METRES || 1000
 );
 const ROUTE_RADIUS_ATTEMPTS_METRES = [null, 1000, 2500, 5000];
+const FAST_ROUTE_RADIUS_ATTEMPTS_METRES = [null, 1000];
+const recentRouteCache = new Map();
+const recentGeocodeCache = new Map();
 
 const createTimeoutError = () => {
   const error = new Error('Journey provider request timed out.');
@@ -23,13 +29,13 @@ const createTimeoutError = () => {
   return error;
 };
 
-const timedJsonFetch = async (url, options, context) => {
+const timedJsonFetch = async (url, options, context, timeoutMs = FIREBASE_TIMEOUT_MS) => {
   const startedAt = Date.now();
 
   try {
     const response = await fetch(url, {
       ...options,
-      signal: AbortSignal.timeout(FIREBASE_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     });
 
     const data = await response.json();
@@ -48,7 +54,7 @@ const timedJsonFetch = async (url, options, context) => {
     if (isTimeout) {
       logger.warn('Journey provider request timed out', {
         context,
-        timeoutMs: FIREBASE_TIMEOUT_MS,
+        timeoutMs,
         durationMs,
       });
       throw createTimeoutError();
@@ -124,6 +130,69 @@ const toLatLngObject = (point) => ({
   lng: Number(point[1].toFixed(6)),
 });
 
+const roundCoordinate = (value) => Number(Number(value).toFixed(4));
+
+const getRouteCacheKey = ({
+  originLat,
+  originLng,
+  destLat,
+  destLng,
+  mode,
+  includeAlternatives,
+}) =>
+  JSON.stringify({
+    mode,
+    includeAlternatives,
+    originLat: roundCoordinate(originLat),
+    originLng: roundCoordinate(originLng),
+    destLat: roundCoordinate(destLat),
+    destLng: roundCoordinate(destLng),
+  });
+
+const getCachedRoute = (cacheKey) => {
+  const cached = recentRouteCache.get(cacheKey);
+  if (!cached) {
+    return null;
+  }
+
+  if (Date.now() - cached.cachedAt > ROUTE_CACHE_TTL_MS) {
+    recentRouteCache.delete(cacheKey);
+    return null;
+  }
+
+  return cached.data;
+};
+
+const setCachedRoute = (cacheKey, data) => {
+  recentRouteCache.set(cacheKey, {
+    data,
+    cachedAt: Date.now(),
+  });
+};
+
+const getGeocodeCacheKey = (query) => String(query || '').trim().toLowerCase();
+
+const getCachedGeocode = (cacheKey) => {
+  const cached = recentGeocodeCache.get(cacheKey);
+  if (!cached) {
+    return null;
+  }
+
+  if (Date.now() - cached.cachedAt > GEOCODE_CACHE_TTL_MS) {
+    recentGeocodeCache.delete(cacheKey);
+    return null;
+  }
+
+  return cached.data;
+};
+
+const setCachedGeocode = (cacheKey, data) => {
+  recentGeocodeCache.set(cacheKey, {
+    data,
+    cachedAt: Date.now(),
+  });
+};
+
 const buildFallbackRoute = ({ originLat, originLng, destLat, destLng, mode = 'vehicle' }) => {
   const totalDistanceMetres = haversine(originLat, originLng, destLat, destLng);
   const segmentCount = Math.max(12, Math.min(60, Math.ceil(totalDistanceMetres / 5000)));
@@ -159,6 +228,7 @@ const buildFallbackRoute = ({ originLat, originLng, destLat, destLng, mode = 've
 
 router.get('/geocode', async (req, res) => {
   const query = String(req.query.query || '').trim();
+  const geocodeCacheKey = getGeocodeCacheKey(query);
 
   logger.info('Journey geocode requested', {
     queryLength: query.length,
@@ -172,6 +242,19 @@ router.get('/geocode', async (req, res) => {
   }
 
   try {
+    const cachedResults = getCachedGeocode(geocodeCacheKey);
+    if (cachedResults) {
+      logger.info('Journey geocode served from cache', {
+        queryLength: query.length,
+        results: cachedResults.length,
+      });
+
+      return res.json({
+        success: true,
+        data: cachedResults,
+      });
+    }
+
     const url = new URL(NOMINATIM_URL);
     url.searchParams.set('format', 'jsonv2');
     url.searchParams.set('q', query);
@@ -208,6 +291,8 @@ router.get('/geocode', async (req, res) => {
       results: results.length,
     });
 
+    setCachedGeocode(geocodeCacheKey, results);
+
     return res.json({
       success: true,
       data: results,
@@ -237,7 +322,16 @@ router.get('/route', async (req, res) => {
   const destLat = parseCoordinate(req.query.dest_lat);
   const destLng = parseCoordinate(req.query.dest_lng);
   const mode = String(req.query.mode || '').toLowerCase() === 'walking' ? 'walking' : 'vehicle';
+  const includeAlternatives = String(req.query.include_alternatives || 'true').toLowerCase() !== 'false';
   const orsDirectionsUrl = ORS_DIRECTION_URLS[mode];
+  const cacheKey = getRouteCacheKey({
+    originLat,
+    originLng,
+    destLat,
+    destLng,
+    mode,
+    includeAlternatives,
+  });
 
   logger.info('Journey route requested', {
     originLat,
@@ -245,6 +339,7 @@ router.get('/route', async (req, res) => {
     destLat,
     destLng,
     mode,
+    includeAlternatives,
   });
 
   if ([originLat, originLng, destLat, destLng].some((value) => value === null)) {
@@ -255,7 +350,24 @@ router.get('/route', async (req, res) => {
   }
 
   try {
+    const cachedRoute = getCachedRoute(cacheKey);
+
+    if (cachedRoute) {
+      logger.info('Journey route served from cache', {
+        mode,
+        includeAlternatives,
+      });
+
+      return res.json({
+        success: true,
+        data: cachedRoute,
+      });
+    }
+
     const orsApiKey = requireOrsApiKey();
+    const radiusAttempts = includeAlternatives
+      ? ROUTE_RADIUS_ATTEMPTS_METRES
+      : FAST_ROUTE_RADIUS_ATTEMPTS_METRES;
 
     const headers = {
       Authorization: orsApiKey,
@@ -265,25 +377,36 @@ router.get('/route', async (req, res) => {
 
     let routeResponse = null;
 
-    for (const radiusMetres of ROUTE_RADIUS_ATTEMPTS_METRES) {
-      const attemptBodies = [
-        buildRouteBody({
-          originLat,
-          originLng,
-          destLat,
-          destLng,
-          includeAlternatives: true,
-          radiusMetres,
-        }),
-        buildRouteBody({
-          originLat,
-          originLng,
-          destLat,
-          destLng,
-          includeAlternatives: false,
-          radiusMetres,
-        }),
-      ];
+    for (const radiusMetres of radiusAttempts) {
+      const attemptBodies = includeAlternatives
+        ? [
+            buildRouteBody({
+              originLat,
+              originLng,
+              destLat,
+              destLng,
+              includeAlternatives: true,
+              radiusMetres,
+            }),
+            buildRouteBody({
+              originLat,
+              originLng,
+              destLat,
+              destLng,
+              includeAlternatives: false,
+              radiusMetres,
+            }),
+          ]
+        : [
+            buildRouteBody({
+              originLat,
+              originLng,
+              destLat,
+              destLng,
+              includeAlternatives: false,
+              radiusMetres,
+            }),
+          ];
 
       for (const [attemptIndex, requestBody] of attemptBodies.entries()) {
         routeResponse = await timedJsonFetch(
@@ -295,7 +418,8 @@ router.get('/route', async (req, res) => {
           },
           radiusMetres
             ? `journeyRouteRadius${radiusMetres}_${attemptIndex + 1}`
-            : `journeyRouteDefault_${attemptIndex + 1}`
+            : `journeyRouteDefault_${attemptIndex + 1}`,
+          ROUTE_REQUEST_TIMEOUT_MS
         );
 
         if (routeResponse.response.ok) {
@@ -363,17 +487,33 @@ router.get('/route', async (req, res) => {
         destLng,
       });
 
+      const fallbackRoute = buildFallbackRoute({
+        originLat,
+        originLng,
+        destLat,
+        destLng,
+        mode,
+      });
+      setCachedRoute(cacheKey, fallbackRoute);
+
       return res.json({
         success: true,
-        data: buildFallbackRoute({
-          originLat,
-          originLng,
-          destLat,
-          destLng,
-          mode,
-        }),
+        data: fallbackRoute,
       });
     }
+
+    const responseData = {
+      route: routes[0].route,
+      eta: routes[0].eta,
+      distance_km: routes[0].distance_km,
+      alternatives: routes.slice(1),
+      resolvedOrigin: routes[0].route.length ? toLatLngObject(routes[0].route[0]) : null,
+      resolvedDestination: routes[0].route.length
+        ? toLatLngObject(routes[0].route[routes[0].route.length - 1])
+        : null,
+      mode,
+    };
+    setCachedRoute(cacheKey, responseData);
 
     logger.info('Journey route planned', {
       mainRoutePoints: routes[0].route.length,
@@ -385,17 +525,7 @@ router.get('/route', async (req, res) => {
 
     return res.json({
       success: true,
-      data: {
-        route: routes[0].route,
-        eta: routes[0].eta,
-        distance_km: routes[0].distance_km,
-        alternatives: routes.slice(1),
-        resolvedOrigin: routes[0].route.length ? toLatLngObject(routes[0].route[0]) : null,
-        resolvedDestination: routes[0].route.length
-          ? toLatLngObject(routes[0].route[routes[0].route.length - 1])
-          : null,
-        mode,
-      },
+      data: responseData,
     });
   } catch (error) {
     if (error.code === 'JOURNEY_TIMEOUT') {
@@ -406,15 +536,18 @@ router.get('/route', async (req, res) => {
         destLng,
       });
 
+      const fallbackRoute = buildFallbackRoute({
+        originLat,
+        originLng,
+        destLat,
+        destLng,
+        mode,
+      });
+      setCachedRoute(cacheKey, fallbackRoute);
+
       return res.json({
         success: true,
-        data: buildFallbackRoute({
-          originLat,
-          originLng,
-          destLat,
-          destLng,
-          mode,
-        }),
+        data: fallbackRoute,
       });
     }
 
@@ -426,15 +559,18 @@ router.get('/route', async (req, res) => {
         destLng,
       });
 
+      const fallbackRoute = buildFallbackRoute({
+        originLat,
+        originLng,
+        destLat,
+        destLng,
+        mode,
+      });
+      setCachedRoute(cacheKey, fallbackRoute);
+
       return res.json({
         success: true,
-        data: buildFallbackRoute({
-          originLat,
-          originLng,
-          destLat,
-          destLng,
-          mode,
-        }),
+        data: fallbackRoute,
       });
     }
 

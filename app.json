@@ -18,7 +18,7 @@
         "NSLocationWhenInUseUsageDescription": "Abhaya uses your location to plan safe journeys and detect route deviations.",
         "NSCameraUsageDescription": "Abhaya uses the camera to scan suspicious vehicles and record emergency evidence.",
         "NSPhotoLibraryUsageDescription": "Abhaya uses your photo library so you can upload vehicle images and save them as evidence.",
-        "NSMicrophoneUsageDescription": "Abhaya uses the microphone to record emergency evidence with audio."
+        "NSMicrophoneUsageDescription": "Abhaya uses the microphone to monitor emergency audio during safety alerts and record emergency evidence with audio."
       }
     },
     "android": {

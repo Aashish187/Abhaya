@@ -42,6 +42,50 @@ const buildEvidenceText = (evidence = []) => {
     .join('\n\n');
 };
 
+const buildVehicleText = (report) => {
+  const vehicle = report?.vehicle || report?.vehicleDetails || {};
+  const summary = [
+    getSafeText(vehicle?.vehicleType, ''),
+    getSafeText(vehicle?.vehicleBrand, ''),
+    getSafeText(vehicle?.vehicleModel, ''),
+    getSafeText(vehicle?.vehicleColor, ''),
+  ]
+    .filter(Boolean)
+    .join(' | ');
+
+  if (!vehicle?.plateNumber && !summary && !vehicle?.identificationMark) {
+    return 'No vehicle data linked.';
+  }
+
+  return [
+    `Plate Number: ${getSafeText(vehicle?.plateNumber)}`,
+    `Vehicle: ${getSafeText(summary)}`,
+    `Visible Mark: ${getSafeText(vehicle?.identificationMark)}`,
+  ].join('\n');
+};
+
+const buildJourneyText = (report) => {
+  const parts = [];
+
+  if (report?.journey?.mode) {
+    parts.push(`Mode: ${getSafeText(report.journey.mode)}`);
+  }
+  if (report?.journey?.destinationName || report?.destination?.name) {
+    parts.push(`Destination: ${getSafeText(report?.journey?.destinationName || report?.destination?.name)}`);
+  }
+  if (Number.isFinite(Number(report?.journey?.etaMinutes))) {
+    parts.push(`ETA: ${Number(report.journey.etaMinutes).toFixed(1)} min`);
+  }
+  if (Number.isFinite(Number(report?.journey?.distanceKm))) {
+    parts.push(`Distance: ${Number(report.journey.distanceKm).toFixed(2)} km`);
+  }
+  if (report?.zone?.name) {
+    parts.push(`Nearby Risk Zone: ${getSafeText(report.zone.name)}`);
+  }
+
+  return parts.length ? parts.join('\n') : 'No journey snapshot available.';
+};
+
 export const buildIncidentReportText = (report) => {
   if (!report?.incidentId) {
     throw new Error('No incident report available to export.');
@@ -57,6 +101,10 @@ export const buildIncidentReportText = (report) => {
     'USER',
     `Name: ${getSafeText(report.user?.name)}`,
     `Phone: ${getSafeText(report.user?.phone)}`,
+    `Email: ${getSafeText(report.user?.email)}`,
+    '',
+    'VEHICLE',
+    buildVehicleText(report),
     '',
     'TRIGGER',
     `Type: ${getSafeText(report.trigger?.type, 'SOS')}`,
@@ -66,6 +114,9 @@ export const buildIncidentReportText = (report) => {
     `Latitude: ${getSafeText(report.location?.lat)}`,
     `Longitude: ${getSafeText(report.location?.lng)}`,
     `Address: ${getSafeText(report.location?.address)}`,
+    '',
+    'JOURNEY SNAPSHOT',
+    buildJourneyText(report),
     '',
     'TIMELINE',
     buildTimelineText(report.timeline),

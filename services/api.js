@@ -279,10 +279,10 @@ export const incidentAPI = {
       body: payload,
     }),
 
-  sendEmergencyEmail: async (report) =>
+  sendEmergencyEmail: async (report, recipients) =>
     apiRequest('/send-email', {
       method: 'POST',
-      body: { report },
+      body: { report, recipients },
       authenticated: false,
     }),
 

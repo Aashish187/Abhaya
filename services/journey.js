@@ -103,19 +103,64 @@ const request = async (endpoint, options = {}) => {
   return payload.data;
 };
 
+const uploadMultipart = async (endpoint, { body, authenticated = false } = {}) => {
+  const headers = {
+    Accept: 'application/json',
+  };
+
+  if (authenticated) {
+    const token = await AsyncStorage.getItem(TOKEN_KEY);
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+    }
+  }
+
+  let response;
+
+  try {
+    response = await fetch(`${BASE_URL}${endpoint}`, {
+      method: 'POST',
+      headers,
+      body,
+    });
+  } catch (error) {
+    const networkError = new Error(backendUnavailableMessage);
+    networkError.cause = error;
+    throw networkError;
+  }
+
+  const payload = await response.json().catch(() => ({}));
+
+  if (!response.ok || payload.success === false) {
+    const error = new Error(payload.error || payload.message || 'Upload request failed.');
+    error.status = response.status;
+    throw error;
+  }
+
+  return payload.data;
+};
+
 const journeyAPI = {
   geocodeDestination: async (query) =>
     request(`/journey/geocode?query=${encodeURIComponent(query)}`, {
       method: 'GET',
     }),
 
-  fetchRoute: async ({ originLat, originLng, destLat, destLng, mode = 'vehicle' }) => {
+  fetchRoute: async ({
+    originLat,
+    originLng,
+    destLat,
+    destLng,
+    mode = 'vehicle',
+    includeAlternatives = true,
+  }) => {
     const url = new URL(`${BASE_URL}/journey/route`);
     url.searchParams.set('origin_lat', originLat);
     url.searchParams.set('origin_lng', originLng);
     url.searchParams.set('dest_lat', destLat);
     url.searchParams.set('dest_lng', destLng);
     url.searchParams.set('mode', mode);
+    url.searchParams.set('include_alternatives', includeAlternatives ? 'true' : 'false');
 
     let response;
 
@@ -156,6 +201,19 @@ const journeyAPI = {
         reason,
       },
     }),
+
+  transcribeAudio: async ({ uri, name = `audio-segment-${Date.now()}.m4a`, type = 'audio/mp4' }) => {
+    const form = new FormData();
+    form.append('audio', {
+      uri,
+      name,
+      type,
+    });
+
+    return uploadMultipart('/audio/transcribe', {
+      body: form,
+    });
+  },
 
   listHistory: async ({ limit, eventLimit } = {}) => {
     const params = new URLSearchParams();

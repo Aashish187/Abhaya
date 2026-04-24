@@ -104,9 +104,15 @@ const buildReportMessage = ({
   addLine('Risk Score', report?.trigger?.riskScore || 'HIGH');
   addLine('User Name', report?.user?.name);
   addLine('User Phone', report?.user?.phone);
+  addLine('User Email', report?.user?.email);
   addLine('Location Address', resolvedLocationAddress || report?.location?.address);
   addLine('Latitude', formatCoordinate(report?.location?.lat));
   addLine('Longitude', formatCoordinate(report?.location?.lng));
+  addLine('Journey Mode', report?.journey?.mode);
+  addLine('Destination', report?.journey?.destinationName || report?.destination?.name);
+  addLine('ETA', report?.journey?.etaMinutes ? `${report.journey.etaMinutes} min` : '');
+  addLine('Distance', report?.journey?.distanceKm ? `${report.journey.distanceKm} km` : '');
+  addLine('Nearby Risk Zone', report?.zone?.name);
 
   if (includeVehicleDetails) {
     addLine('Plate Number', vehicleDetails.plateNumber);
@@ -527,6 +533,7 @@ export default function ReportDetailsScreen({ navigation, route }) {
           >
             <ReportMetricRow label="User Name" value={report.user?.name} />
             <ReportMetricRow label="User Phone" value={report.user?.phone} />
+            <ReportMetricRow label="User Email" value={report.user?.email} />
           </SectionCard>
 
           {shouldShowVehicleSection ? (
@@ -560,6 +567,36 @@ export default function ReportDetailsScreen({ navigation, route }) {
               <Text style={styles.inlineMapButtonText}>View Incident Location</Text>
             </TouchableOpacity>
           </SectionCard>
+
+          {report?.journey || report?.zone ? (
+            <SectionCard
+              iconName="navigate-outline"
+              iconColor="#2ecc71"
+              title="Journey Snapshot"
+              subtitle="Live runtime journey data captured when SOS was triggered"
+            >
+              <ReportMetricRow label="Journey Mode" value={report?.journey?.mode} />
+              <ReportMetricRow label="Destination" value={report?.journey?.destinationName || report?.destination?.name} />
+              <ReportMetricRow
+                label="ETA"
+                value={
+                  Number.isFinite(Number(report?.journey?.etaMinutes))
+                    ? `${Number(report.journey.etaMinutes).toFixed(1)} min`
+                    : ''
+                }
+              />
+              <ReportMetricRow
+                label="Distance"
+                value={
+                  Number.isFinite(Number(report?.journey?.distanceKm))
+                    ? `${Number(report.journey.distanceKm).toFixed(2)} km`
+                    : ''
+                }
+              />
+              <ReportMetricRow label="Monitoring" value={report?.journey?.monitoringStatus} />
+              <ReportMetricRow label="Nearby Risk Zone" value={report?.zone?.name} />
+            </SectionCard>
+          ) : null}
 
           <SectionCard
             iconName="time-outline"
