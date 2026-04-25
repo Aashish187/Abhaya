@@ -21,6 +21,8 @@ import { getLatestIncidentReport } from '../services/reportStorage';
 import { calculateRiskPercentage, getSafetyRecommendations } from '../services/riskAssessment';
 
 const { width } = Dimensions.get('window');
+const HOME_SOS_TAP_REQUIRED = 3;
+const HOME_SOS_TAP_WINDOW_MS = 2000;
 
 const actionCards = [
   {
@@ -102,7 +104,9 @@ export default function HomeScreen({ navigation }) {
   const [currentLocation, setCurrentLocation] = useState(null);
   const [journeyData, setJourneyData] = useState(null);
   const [recommendations, setRecommendations] = useState([]);
+  const [sosTapCount, setSosTapCount] = useState(0);
   const locationTrackerRef = React.useRef(null);
+  const sosTapResetTimerRef = React.useRef(null);
 
   const loadRecentActivity = useCallback(async () => {
     setActivityLoading(true);
@@ -255,7 +259,14 @@ export default function HomeScreen({ navigation }) {
     }, [loadRecentActivity, loadJourneyData])
   );
 
-  const handleSosPress = () => {
+  useEffect(() => () => {
+    if (sosTapResetTimerRef.current) {
+      clearTimeout(sosTapResetTimerRef.current);
+      sosTapResetTimerRef.current = null;
+    }
+  }, []);
+
+  const launchHomeSosFlow = useCallback(() => {
     Alert.alert('SOS Activated', 'Emergency detected. Recording started.', [
       {
         text: 'OK',
@@ -266,7 +277,28 @@ export default function HomeScreen({ navigation }) {
           }),
       },
     ]);
-  };
+  }, [navigation]);
+
+  const handleSosPress = useCallback(() => {
+    const nextCount = sosTapCount + 1;
+
+    if (sosTapResetTimerRef.current) {
+      clearTimeout(sosTapResetTimerRef.current);
+      sosTapResetTimerRef.current = null;
+    }
+
+    if (nextCount >= HOME_SOS_TAP_REQUIRED) {
+      setSosTapCount(0);
+      launchHomeSosFlow();
+      return;
+    }
+
+    setSosTapCount(nextCount);
+    sosTapResetTimerRef.current = setTimeout(() => {
+      setSosTapCount(0);
+      sosTapResetTimerRef.current = null;
+    }, HOME_SOS_TAP_WINDOW_MS);
+  }, [launchHomeSosFlow, sosTapCount]);
 
   const openReportsSection = useCallback(async () => {
     try {
@@ -564,7 +596,11 @@ export default function HomeScreen({ navigation }) {
           </View>
         </TouchableOpacity>
 
-        <Text style={styles.sosHint}>Tap SOS to activate emergency</Text>
+        <Text style={styles.sosHint}>
+          {sosTapCount > 0
+            ? `Tap ${HOME_SOS_TAP_REQUIRED - sosTapCount} more time${HOME_SOS_TAP_REQUIRED - sosTapCount === 1 ? '' : 's'} to activate emergency`
+            : 'Tap SOS 3 times to activate emergency'}
+        </Text>
 
         <View style={styles.activityCard}>
           <View style={styles.activityHeader}>

@@ -556,7 +556,26 @@ const createTwilioTransport = () => {
   };
 };
 
-const sendEmergencySmsAlerts = async (report, recipients = DEFAULT_SMS_RECIPIENTS) => {
+const resolveDeliveryPreferences = (deliveryPreferences = {}) => ({
+  smsEnabled: deliveryPreferences?.smsEnabled !== false,
+  callEnabled: deliveryPreferences?.callEnabled !== false,
+});
+
+const sendEmergencySmsAlerts = async (
+  report,
+  recipients = DEFAULT_SMS_RECIPIENTS,
+  { enabled = true } = {}
+) => {
+  if (!enabled) {
+    return {
+      success: false,
+      delivered: 0,
+      recipients: [],
+      error: '',
+      skipped: true,
+    };
+  }
+
   const twilioTransport = createTwilioTransport();
   if (!twilioTransport.ok) {
     logger.warn('Emergency SMS transport unavailable', {
@@ -628,7 +647,21 @@ const sendEmergencySmsAlerts = async (report, recipients = DEFAULT_SMS_RECIPIENT
   };
 };
 
-const sendEmergencyCallAlerts = async (report, recipients = HARDCODED_CALL_RECIPIENTS) => {
+const sendEmergencyCallAlerts = async (
+  report,
+  recipients = HARDCODED_CALL_RECIPIENTS,
+  { enabled = true } = {}
+) => {
+  if (!enabled) {
+    return {
+      success: false,
+      placed: 0,
+      recipients: [],
+      error: '',
+      skipped: true,
+    };
+  }
+
   const twilioTransport = createTwilioTransport();
   if (!twilioTransport.ok) {
     logger.warn('Emergency call transport unavailable', {
@@ -701,25 +734,33 @@ const sendEmergencyCallAlerts = async (report, recipients = HARDCODED_CALL_RECIP
   };
 };
 
-const sendEmergencyEmail = async (report, recipients = DEFAULT_RECIPIENTS) => {
+const sendEmergencyEmail = async (
+  report,
+  recipients = DEFAULT_RECIPIENTS,
+  deliveryPreferences = {}
+) => {
+  const resolvedDeliveryPreferences = resolveDeliveryPreferences(deliveryPreferences);
   const channels = {
     email: {
       success: false,
       delivered: 0,
       recipients: [],
       error: '',
+      skipped: false,
     },
     sms: {
       success: false,
       delivered: 0,
       recipients: [],
       error: '',
+      skipped: false,
     },
     call: {
       success: false,
       placed: 0,
       recipients: [],
       error: '',
+      skipped: false,
     },
   };
 
@@ -784,8 +825,12 @@ const sendEmergencyEmail = async (report, recipients = DEFAULT_RECIPIENTS) => {
     }
   }
 
-  channels.sms = await sendEmergencySmsAlerts(report, DEFAULT_SMS_RECIPIENTS);
-  channels.call = await sendEmergencyCallAlerts(report, HARDCODED_CALL_RECIPIENTS);
+  channels.sms = await sendEmergencySmsAlerts(report, DEFAULT_SMS_RECIPIENTS, {
+    enabled: resolvedDeliveryPreferences.smsEnabled,
+  });
+  channels.call = await sendEmergencyCallAlerts(report, HARDCODED_CALL_RECIPIENTS, {
+    enabled: resolvedDeliveryPreferences.callEnabled,
+  });
 
   const success = channels.email.success || channels.sms.success || channels.call.success;
   const successfulChannels = [

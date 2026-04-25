@@ -354,6 +354,34 @@ export default function SettingsScreen({ navigation }) {
               />
             )
           )}
+          <View style={styles.divider} />
+          {renderItem(
+            'chatbubble-ellipses-outline',
+            '#8c63db',
+            'Emergency SMS Alerts',
+            'Disable to send only email alerts during SOS',
+            (
+              <Switch
+                value={journeySettings?.smsAlertsEnabled ?? true}
+                trackColor={{ true: '#8c63db', false: '#e0e0e0' }}
+                onValueChange={(value) => handleJourneySettingUpdate('smsAlertsEnabled', value, () => {})}
+              />
+            )
+          )}
+          <View style={styles.divider} />
+          {renderItem(
+            'call-outline',
+            '#8c63db',
+            'Emergency Auto Call',
+            'Disable to avoid Twilio call credits during testing',
+            (
+              <Switch
+                value={journeySettings?.callAlertsEnabled ?? true}
+                trackColor={{ true: '#8c63db', false: '#e0e0e0' }}
+                onValueChange={(value) => handleJourneySettingUpdate('callAlertsEnabled', value, () => {})}
+              />
+            )
+          )}
         </View>
 
         <Text style={styles.sectionHeading}>Vehicle Safety</Text>

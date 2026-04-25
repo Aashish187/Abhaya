@@ -1357,7 +1357,7 @@ export default function JourneyScreen({ navigation, route: screenRoute }) {
       finalizeJourney: true,
     });
     dismissSafetyPrompt();
-  }, [dismissSafetyPrompt, safetyPrompt?.type, triggerSOS]);
+  }, [dismissSafetyPrompt, safetyPrompt, triggerSOS]);
 
   const addJourneyLog = useCallback(async ({ type, message, metadata }) => {
     const historyId = activeHistoryIdRef.current;

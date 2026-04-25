@@ -19,6 +19,7 @@ import { useReport } from '../context/ReportContext';
 import { incidentAPI, videoAPI } from '../services/api';
 import AudioAnalysisService from '../services/AudioAnalysisService';
 import { getEmergencyEmailAddresses } from '../services/emergencyEmailContacts';
+import { getJourneySettings } from '../services/journeySettings';
 import { saveIncidentReport } from '../services/reportStorage';
 
 const RECORD_SECONDS = 7;
@@ -371,7 +372,11 @@ export default function IncidentReportScreen({ navigation, route }) {
         };
 
         const emailRecipients = await getEmergencyEmailAddresses();
-        const emailResult = await incidentAPI.sendEmergencyEmail(updatedReport, emailRecipients);
+        const journeySettings = await getJourneySettings();
+        const emailResult = await incidentAPI.sendEmergencyEmail(updatedReport, emailRecipients, {
+          smsEnabled: journeySettings?.smsAlertsEnabled !== false,
+          callEnabled: journeySettings?.callAlertsEnabled !== false,
+        });
         const finalReport = {
           ...updatedReport,
           notification: {

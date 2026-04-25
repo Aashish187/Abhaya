@@ -10,6 +10,8 @@ export const DEFAULT_JOURNEY_SETTINGS = {
   emergencyAlertDelay: 10, // in seconds
   locationTrackingInterval: 5, // in seconds
   crimeZoneAlertRadius: 500, // in meters
+  smsAlertsEnabled: true, // enabled/disabled
+  callAlertsEnabled: true, // enabled/disabled
 };
 
 // Idle threshold options in minutes
@@ -55,7 +57,10 @@ export const getJourneySettings = async () => {
   try {
     const stored = await AsyncStorage.getItem(JOURNEY_SETTINGS_KEY);
     if (stored) {
-      return JSON.parse(stored);
+      return {
+        ...DEFAULT_JOURNEY_SETTINGS,
+        ...JSON.parse(stored),
+      };
     }
     return DEFAULT_JOURNEY_SETTINGS;
   } catch (error) {

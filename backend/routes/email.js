@@ -8,11 +8,15 @@ router.post('/', async (req, res) => {
   try {
     const report = req?.body?.report;
     const recipients = Array.isArray(req?.body?.recipients) ? req.body.recipients : DEFAULT_RECIPIENTS;
+    const deliveryPreferences =
+      req?.body?.deliveryPreferences && typeof req.body.deliveryPreferences === 'object'
+        ? req.body.deliveryPreferences
+        : {};
     if (!report || typeof report !== 'object') {
       return res.status(400).json({ success: false, error: 'report is required.' });
     }
 
-    const result = await sendEmergencyEmail(report, recipients);
+    const result = await sendEmergencyEmail(report, recipients, deliveryPreferences);
 
     if (!result?.success) {
       logger.warn('Emergency alert route failed', {
@@ -44,3 +48,4 @@ router.post('/', async (req, res) => {
 });
 
 module.exports = router;
+
