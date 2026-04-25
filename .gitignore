@@ -27,6 +27,12 @@ backend/.env*.local
 serviceAccountKey.json
 backend/serviceAccountKey.json
 **/serviceAccountKey.json
+backend/config/serviceAccountKey.json
+**/*serviceAccount*.json
+**/*firebase-adminsdk*.json
+google-services.json
+android/app/google-services.json
+ios/GoogleService-Info.plist
 *.pem
 *.key
 *.jks

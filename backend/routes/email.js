@@ -15,24 +15,31 @@ router.post('/', async (req, res) => {
     const result = await sendEmergencyEmail(report, recipients);
 
     if (!result?.success) {
-      logger.warn('Emergency email route failed', {
+      logger.warn('Emergency alert route failed', {
         incidentId: report?.incidentId,
         error: result?.error || 'Failed to send emergency email.',
+        channels: result?.channels || null,
       });
 
       return res.status(502).json({
         success: false,
-        error: result?.error || 'Failed to send emergency email.',
+        error: result?.error || 'Failed to send emergency alert.',
+        message: result?.message || 'Emergency alert delivery failed.',
+        channels: result?.channels || null,
       });
     }
 
-    return res.json({ success: true });
+    return res.json({
+      success: true,
+      message: result?.message || 'Emergency alert delivered.',
+      channels: result?.channels || null,
+    });
   } catch (error) {
-    logger.error('Emergency email route crashed', {
+    logger.error('Emergency alert route crashed', {
       error: error?.message || String(error),
     });
 
-    return res.status(500).json({ success: false, error: 'Failed to send emergency email.' });
+    return res.status(500).json({ success: false, error: 'Failed to send emergency alert.' });
   }
 });
 

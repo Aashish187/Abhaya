@@ -25,7 +25,7 @@ const RECORD_SECONDS = 7;
 const CAMERA_READY_DELAY_MS = 120;
 const MAX_VIDEO_BYTES = 3 * 1024 * 1024;
 const EMAIL_FAILURE_MESSAGE =
-  'Report saved, but emergency email could not be sent. Check backend Gmail settings in backend/.env.';
+  'Report saved, but emergency delivery could not be completed. Check email and Twilio settings in backend/.env.';
 
 const createIncidentId = () =>
   `inc_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
@@ -374,7 +374,10 @@ export default function IncidentReportScreen({ navigation, route }) {
         const emailResult = await incidentAPI.sendEmergencyEmail(updatedReport, emailRecipients);
         const finalReport = {
           ...updatedReport,
-          notification: { sent: Boolean(emailResult?.success) },
+          notification: {
+            sent: Boolean(emailResult?.success),
+            channels: emailResult?.channels || null,
+          },
         };
 
         await saveIncidentReport(finalReport);
@@ -392,10 +395,13 @@ export default function IncidentReportScreen({ navigation, route }) {
 
         setTimeout(() => {
           if (emailResult?.success) {
-            Alert.alert('Success', 'Emergency alert sent via email');
+            Alert.alert(
+              'Emergency Alert Sent',
+              emailResult?.message || 'Emergency alert sent across available channels.'
+            );
           } else {
             Alert.alert(
-              'Email Not Sent',
+              'Emergency Alert Failed',
               emailResult?.error || EMAIL_FAILURE_MESSAGE
             );
           }

@@ -1,6 +1,7 @@
 const nodemailer = require('nodemailer');
 const dns = require('dns');
 const net = require('net');
+const twilio = require('twilio');
 const logger = require('../utils/logger');
 
 const DEFAULT_RECIPIENTS = [
@@ -9,6 +10,13 @@ const DEFAULT_RECIPIENTS = [
   'gaikwadshambhu24@gmail.com',
   'ameymohite2006@gmail.com',
 ];
+const DEFAULT_SMS_RECIPIENTS = [
+  process.env.EMERGENCY_CONTACT_NUMBER || '+919860274550',
+  process.env.POLICE_CONTACT_NUMBER || '',
+].map((value) => String(value || '').trim()).filter(Boolean);
+const HARDCODED_CALL_RECIPIENTS = [
+  process.env.TWILIO_CALL_TO_NUMBER || '+919860274550',
+].map((value) => String(value || '').trim()).filter(Boolean);
 
 const unavailableValuePattern = /^(unknown\b.*|not available|plate not readable|plate not detected|-|n\/a)$/i;
 
@@ -49,6 +57,14 @@ const formatCoordinate = (value) => {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric.toFixed(6) : 'N/A';
 };
+
+const escapeXml = (value) =>
+  String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
 
 const escapeHtml = (value) =>
   String(value ?? '')
@@ -112,6 +128,42 @@ const buildJourneyRows = (report) => {
   }
 
   return rows;
+};
+
+const buildEmergencySmsBodyFromReport = (report) => {
+  const mapLink = buildMapLink(report?.location);
+  const lines = [
+    'ABHAYA SOS ALERT',
+    `Incident: ${safeText(report?.incidentId)}`,
+    `Trigger: ${safeText(report?.trigger?.type, 'SOS')}`,
+    report?.trigger?.reason ? `Reason: ${safeText(report.trigger.reason)}` : '',
+    `User: ${safeText(report?.user?.name)}`,
+    `Phone: ${safeText(report?.user?.phone)}`,
+    `Location: ${safeText(report?.location?.address)}`,
+    `Lat/Lng: ${formatCoordinate(report?.location?.lat)}, ${formatCoordinate(report?.location?.lng)}`,
+    mapLink ? `Map: ${mapLink}` : '',
+    pickFirstVideoEvidenceUrl(report) ? `Evidence: ${pickFirstVideoEvidenceUrl(report)}` : '',
+  ].filter(Boolean);
+
+  return lines.join('\n');
+};
+
+const buildEmergencyCallScriptFromReport = (report) => {
+  const userName = safeText(report?.user?.name, 'the Abhaya user');
+  const triggerType = safeText(report?.trigger?.type, 'SOS');
+  const triggerReason = safeText(report?.trigger?.reason, '');
+  const locationText = safeText(report?.location?.address, 'location unavailable');
+
+  return [
+    'This is an automatic emergency call from Abhaya.',
+    `An SOS alert has been triggered for ${userName}.`,
+    `Trigger type: ${triggerType}.`,
+    triggerReason && triggerReason !== 'N/A' ? `Reported reason: ${triggerReason}.` : '',
+    `Last known location: ${locationText}.`,
+    'Please respond immediately and contact the user or emergency support now.',
+  ]
+    .filter(Boolean)
+    .join(' ');
 };
 
 const buildEmergencyEmailBodyFromReport = (report) => {
@@ -482,71 +534,286 @@ const createGmailTransporter = async () => {
   return { ok: true, transporter, user };
 };
 
+const createTwilioTransport = () => {
+  const accountSid = String(process.env.TWILIO_ACCOUNT_SID || '').trim();
+  const authToken = String(process.env.TWILIO_AUTH_TOKEN || '').trim();
+  const fromNumber = String(process.env.TWILIO_FROM_NUMBER || '').trim();
+
+  if (!accountSid) {
+    return { ok: false, error: 'TWILIO_ACCOUNT_SID is missing in backend/.env.' };
+  }
+  if (!authToken) {
+    return { ok: false, error: 'TWILIO_AUTH_TOKEN is missing in backend/.env.' };
+  }
+  if (!fromNumber) {
+    return { ok: false, error: 'TWILIO_FROM_NUMBER is missing in backend/.env.' };
+  }
+
+  return {
+    ok: true,
+    client: twilio(accountSid, authToken),
+    fromNumber,
+  };
+};
+
+const sendEmergencySmsAlerts = async (report, recipients = DEFAULT_SMS_RECIPIENTS) => {
+  const twilioTransport = createTwilioTransport();
+  if (!twilioTransport.ok) {
+    logger.warn('Emergency SMS transport unavailable', {
+      error: twilioTransport.error,
+    });
+    return {
+      success: false,
+      delivered: 0,
+      recipients: [],
+      error: twilioTransport.error,
+    };
+  }
+
+  const cleanRecipients = Array.isArray(recipients)
+    ? recipients.map((value) => String(value || '').trim()).filter(Boolean)
+    : DEFAULT_SMS_RECIPIENTS;
+
+  if (!cleanRecipients.length) {
+    return {
+      success: false,
+      delivered: 0,
+      recipients: [],
+      error: 'No SMS recipients configured.',
+    };
+  }
+
+  const body = buildEmergencySmsBodyFromReport(report || {});
+  const settled = await Promise.allSettled(
+    cleanRecipients.map((to) =>
+      twilioTransport.client.messages.create({
+        to,
+        from: twilioTransport.fromNumber,
+        body,
+      })
+    )
+  );
+
+  const deliveredRecipients = [];
+  let firstError = '';
+
+  settled.forEach((result, index) => {
+    if (result.status === 'fulfilled') {
+      deliveredRecipients.push(cleanRecipients[index]);
+      return;
+    }
+
+    if (!firstError) {
+      firstError = result.reason?.message || 'Failed to send emergency SMS alert.';
+    }
+  });
+
+  if (deliveredRecipients.length) {
+    logger.info('Emergency SMS alert sent', {
+      incidentId: report?.incidentId,
+      recipients: deliveredRecipients,
+    });
+  } else {
+    logger.warn('Emergency SMS alert failed', {
+      incidentId: report?.incidentId,
+      error: firstError || 'Failed to send emergency SMS alert.',
+    });
+  }
+
+  return {
+    success: deliveredRecipients.length > 0,
+    delivered: deliveredRecipients.length,
+    recipients: deliveredRecipients,
+    error: deliveredRecipients.length ? '' : firstError || 'Failed to send emergency SMS alert.',
+  };
+};
+
+const sendEmergencyCallAlerts = async (report, recipients = HARDCODED_CALL_RECIPIENTS) => {
+  const twilioTransport = createTwilioTransport();
+  if (!twilioTransport.ok) {
+    logger.warn('Emergency call transport unavailable', {
+      error: twilioTransport.error,
+    });
+    return {
+      success: false,
+      placed: 0,
+      recipients: [],
+      error: twilioTransport.error,
+    };
+  }
+
+  const cleanRecipients = Array.isArray(recipients)
+    ? recipients.map((value) => String(value || '').trim()).filter(Boolean)
+    : HARDCODED_CALL_RECIPIENTS;
+
+  if (!cleanRecipients.length) {
+    return {
+      success: false,
+      placed: 0,
+      recipients: [],
+      error: 'No call recipients configured.',
+    };
+  }
+
+  const callScript = escapeXml(buildEmergencyCallScriptFromReport(report || {}));
+  const twiml = `<Response><Say voice="alice">${callScript}</Say></Response>`;
+  const settled = await Promise.allSettled(
+    cleanRecipients.map((to) =>
+      twilioTransport.client.calls.create({
+        to,
+        from: twilioTransport.fromNumber,
+        twiml,
+      })
+    )
+  );
+
+  const placedRecipients = [];
+  let firstError = '';
+
+  settled.forEach((result, index) => {
+    if (result.status === 'fulfilled') {
+      placedRecipients.push(cleanRecipients[index]);
+      return;
+    }
+
+    if (!firstError) {
+      firstError = result.reason?.message || 'Failed to place emergency call.';
+    }
+  });
+
+  if (placedRecipients.length) {
+    logger.info('Emergency auto-call placed', {
+      incidentId: report?.incidentId,
+      recipients: placedRecipients,
+    });
+  } else {
+    logger.warn('Emergency auto-call failed', {
+      incidentId: report?.incidentId,
+      error: firstError || 'Failed to place emergency call.',
+    });
+  }
+
+  return {
+    success: placedRecipients.length > 0,
+    placed: placedRecipients.length,
+    recipients: placedRecipients,
+    error: placedRecipients.length ? '' : firstError || 'Failed to place emergency call.',
+  };
+};
+
 const sendEmergencyEmail = async (report, recipients = DEFAULT_RECIPIENTS) => {
+  const channels = {
+    email: {
+      success: false,
+      delivered: 0,
+      recipients: [],
+      error: '',
+    },
+    sms: {
+      success: false,
+      delivered: 0,
+      recipients: [],
+      error: '',
+    },
+    call: {
+      success: false,
+      placed: 0,
+      recipients: [],
+      error: '',
+    },
+  };
+
   const transportResult = await createGmailTransporter();
   if (!transportResult.ok) {
     logger.warn('Emergency email transport unavailable', {
       error: transportResult.error,
     });
-    return { success: false, error: transportResult.error };
-  }
+    channels.email.error = transportResult.error;
+  } else {
+    const toList = Array.isArray(recipients) ? recipients : DEFAULT_RECIPIENTS;
+    const cleanRecipients = toList.map((recipient) => String(recipient || '').trim()).filter(Boolean);
 
-  const toList = Array.isArray(recipients) ? recipients : DEFAULT_RECIPIENTS;
-  const cleanRecipients = toList.map((recipient) => String(recipient || '').trim()).filter(Boolean);
-  if (!cleanRecipients.length) {
-    return { success: false, error: 'No email recipients configured.' };
-  }
+    if (!cleanRecipients.length) {
+      channels.email.error = 'No email recipients configured.';
+    } else {
+      const subject = `Emergency Alert - Abhaya${report?.incidentId ? ` (${report.incidentId})` : ''}`;
+      const text = buildEmergencyEmailBodyFromReport(report || {});
+      const html = buildEmergencyEmailHtmlFromReport(report || {});
 
-  const subject = `Emergency Alert - Abhaya${report?.incidentId ? ` (${report.incidentId})` : ''}`;
-  const text = buildEmergencyEmailBodyFromReport(report || {});
-  const html = buildEmergencyEmailHtmlFromReport(report || {});
+      logger.info('Sending emergency email', {
+        incidentId: report?.incidentId,
+        recipients: cleanRecipients,
+      });
 
-  logger.info('Sending emergency email', {
-    incidentId: report?.incidentId,
-    recipients: cleanRecipients,
-  });
+      try {
+        const info = await transportResult.transporter.sendMail({
+          from: transportResult.user,
+          to: cleanRecipients.join(', '),
+          subject,
+          text,
+          html,
+        });
 
-  try {
-    const info = await transportResult.transporter.sendMail({
-      from: transportResult.user,
-      to: cleanRecipients.join(', '),
-      subject,
-      text,
-      html,
-    });
+        logger.info('Emergency email sent', {
+          messageId: info?.messageId,
+          accepted: info?.accepted,
+          rejected: info?.rejected,
+          response: info?.response,
+        });
 
-    logger.info('Emergency email sent', {
-      messageId: info?.messageId,
-      accepted: info?.accepted,
-      rejected: info?.rejected,
-      response: info?.response,
-    });
+        channels.email = {
+          success: true,
+          delivered: Array.isArray(info?.accepted) ? info.accepted.length : cleanRecipients.length,
+          recipients: cleanRecipients,
+          error: '',
+        };
+      } catch (error) {
+        logger.warn('Emergency email send failed', {
+          message: error?.message || 'Email send failed.',
+          code: error?.code,
+          response: error?.response,
+          responseCode: error?.responseCode,
+          command: error?.command,
+        });
 
-    return { success: true, info };
-  } catch (error) {
-    logger.warn('Emergency email send failed', {
-      message: error?.message || 'Email send failed.',
-      code: error?.code,
-      response: error?.response,
-      responseCode: error?.responseCode,
-      command: error?.command,
-    });
-
-    if (error?.code === 'EAUTH' || Number(error?.responseCode) === 535) {
-      return {
-        success: false,
-        error:
-          'Emergency email login failed. Update EMAIL_USER and EMAIL_PASS in backend/.env with a valid Gmail address and Gmail App Password.',
-      };
+        channels.email.error =
+          error?.code === 'EAUTH' || Number(error?.responseCode) === 535
+            ? 'Emergency email login failed. Update EMAIL_USER and EMAIL_PASS in backend/.env with a valid Gmail address and Gmail App Password.'
+            : error?.message || 'Failed to send emergency email.';
+      }
     }
-
-    return { success: false, error: error?.message || 'Failed to send emergency email.' };
   }
+
+  channels.sms = await sendEmergencySmsAlerts(report, DEFAULT_SMS_RECIPIENTS);
+  channels.call = await sendEmergencyCallAlerts(report, HARDCODED_CALL_RECIPIENTS);
+
+  const success = channels.email.success || channels.sms.success || channels.call.success;
+  const successfulChannels = [
+    channels.email.success ? 'email' : '',
+    channels.sms.success ? 'sms' : '',
+    channels.call.success ? 'call' : '',
+  ].filter(Boolean);
+
+  const message = successfulChannels.length
+    ? `Emergency alerts sent via ${successfulChannels.join(', ')}.`
+    : 'Emergency alert delivery failed on email, SMS, and call.';
+
+  return {
+    success,
+    message,
+    channels,
+    error: success
+      ? ''
+      : channels.email.error || channels.sms.error || channels.call.error || 'Failed to send emergency alerts.',
+  };
 };
 
 module.exports = {
   DEFAULT_RECIPIENTS,
+  DEFAULT_SMS_RECIPIENTS,
+  HARDCODED_CALL_RECIPIENTS,
   sendEmergencyEmail,
   buildEmergencyEmailBodyFromReport,
   buildEmergencyEmailHtmlFromReport,
+  buildEmergencySmsBodyFromReport,
 };
