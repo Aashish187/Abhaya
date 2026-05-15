@@ -112,7 +112,34 @@ The project contains both:
 - GitHub
 
 ---
+## System Architecture
 
+### High-Level Overview
+
+Abhaya follows a client-server architecture where the mobile application communicates with a backend API responsible for evidence management, report generation, and emergency notifications.
+
+```text
++---------------------------+
+|  React Native Mobile App  |
+|      (Expo Frontend)      |
++-------------+-------------+
+              |
+              | REST API Requests
+              v
++---------------------------+
+|   Node.js + Express API   |
++-------------+-------------+
+              |
+    +---------+---------+
+    |         |         |
+    v         v         v
++----------+ +-----------+ +-------------------+
+| Firebase | | Cloudinary| | Twilio/Nodemailer|
+| Database | | Media CDN | | Notifications     |
++----------+ +-----------+ +-------------------+
+```
+
+---
 ## Project Structure
 
 ```bash
