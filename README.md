@@ -220,9 +220,8 @@ This architecture separates frontend and backend responsibilities, making the sy
 - maintainable
 - easier to extend
 - contributor-friendly
+- It also allows media handling, emergency communication, and report management to remain modular and independently manageable.
 
-It also allows media handling, emergency communication, and report management to remain modular and independently manageable.
-```
 ---
 ## Project Structure
 
