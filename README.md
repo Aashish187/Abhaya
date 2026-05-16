@@ -121,30 +121,22 @@ Abhaya follows a client-server architecture where the mobile application communi
 ```mermaid
 flowchart TD
 
-    A[React Native Mobile App<br/>Expo Frontend]
+    A["React Native Mobile App"]
+    B["Express Backend API"]
+    C["Firebase"]
+    D["Cloudinary"]
+    E["Notification Service"]
+    F["SOS Reports"]
 
-    B[Node.js + Express API]
+    A -->|API Requests| B
+    A -->|Capture Evidence| F
 
-    C[Firebase<br/>Database & Auth]
+    F -->|Upload Media| D
 
-    D[Cloudinary<br/>Media Storage]
-
-    E[Email Notification Service]
-
-    F[SOS & Incident Reports]
-
-    A -->|SOS Trigger / API Requests| B
-
-    A -->|Capture Video, Audio, Location| F
-
-    F -->|Upload Evidence| D
-
-    B -->|Store Reports & Metadata| C
-
-    B -->|Send Emergency Alerts| E
+    B -->|Store Reports| C
+    B -->|Send Alerts| E
 
     D -->|Media URLs| B
-
     B -->|Processed Reports| A
 ```
 
@@ -156,31 +148,21 @@ flowchart TD
 sequenceDiagram
 
     participant User
-    participant MobileApp
+    participant App
     participant Backend
     participant Cloudinary
     participant Firebase
-    participant NotificationService
+    participant Notification
 
-    User->>MobileApp: Trigger SOS
-
-    MobileApp->>MobileApp: Capture Location
-
-    MobileApp->>MobileApp: Record Video/Audio
-
-    MobileApp->>Cloudinary: Upload Evidence
-
-    Cloudinary-->>Backend: Return Media URL
-
-    MobileApp->>Backend: Send Incident Report
-
-    Backend->>Firebase: Store Report & Metadata
-
-    Backend->>NotificationService: Send Emergency Alerts
-
-    NotificationService-->>User: Alert Delivered
+    User->>App: Trigger SOS
+    App->>App: Capture Location
+    App->>App: Record Evidence
+    App->>Cloudinary: Upload Media
+    Cloudinary-->>Backend: Media URL
+    App->>Backend: Send Report
+    Backend->>Firebase: Store Report
+    Backend->>Notification: Send Alerts
 ```
-
 ---
 
 ### Component Responsibilities
@@ -241,7 +223,6 @@ This architecture separates frontend and backend responsibilities, making the sy
 
 It also allows media handling, emergency communication, and report management to remain modular and independently manageable.
 ```
-
 ---
 ## Project Structure
 
